@@ -56,6 +56,25 @@ _HISTORY_HINT = re.compile(
     r"เปลี่ยนแปลง|ต่างจาก|เทียบ|ยกเลิก|เพิ่มเติม"
 )
 
+# คำที่บ่งว่าต้องการ "ไล่ดูตัวบทข้ามฉบับ" ไม่ใช่ "ตัวบท ณ จุดเวลาใดจุดหนึ่ง"
+_COMPARE_HINT = re.compile(
+    r"ต่างกัน|ต่างจาก|แตกต่าง|เปรียบเทียบ|เทียบ|ก่อนและหลัง|ก่อนกับหลัง|"
+    r"ถูกแก้|เคยแก้|แก้ไขกี่|กี่ครั้ง|แก้เมื่อไร|แก้ไขเมื่อไร|ประวัติการแก้|"
+    r"เปลี่ยนไปอย่างไร|เปลี่ยนแปลงอย่างไร"
+)
+
+
+def detect_compare(question: str) -> str:
+    """คำถามนี้ต้องการ 'ไล่ตัวบทข้ามฉบับ' ไหม -> คืนเลขมาตราที่ถาม ('' = ไม่ใช่)
+
+    ต้องมีครบสองอย่าง: คำที่บ่งการเปรียบเทียบ/ประวัติ + เลขมาตราที่เจาะจง
+    เพราะเส้นทางนี้ดึงตัวบทตามเลขมาตราตรง ๆ ถ้าไม่รู้ว่ามาตราไหนก็ทำงานไม่ได้
+    (ถามลอย ๆ ว่า 'กฎหมายเปลี่ยนไปอย่างไรบ้าง' จะตกไปใช้เส้นทางค้นปกติ)"""
+    if not _COMPARE_HINT.search(question or ""):
+        return ""
+    arts = rag.question_articles(question)
+    return arts[0] if arts else ""
+
 
 def pick_groups(question: str, all_groups: list[str]) -> tuple[list[str], list[int], list[int]]:
     """ตัดสิน 'ควรค้นกลุ่มไหน' ด้วยกฎในโค้ด ไม่ใช่ให้ LLM เดา
@@ -199,6 +218,66 @@ def build_user_prompt(question: str, context: str, domain: str = "thai_law") -> 
     )
 
 
+def _stream_answer(llm, messages, stream: bool):
+    """ยิง messages เข้า LLM แล้ว yield token — ใช้ร่วมกันทั้งสองเส้นทาง
+    คืน (answer, reasoning) ผ่าน StopIteration value ของ generator"""
+    answer, reasoning = "", ""
+    if stream:
+        full = None
+        try:
+            gen = llm.stream(messages, stream_usage=True)
+        except TypeError:
+            gen = llm.stream(messages)
+        for chunk in gen:
+            full = chunk if full is None else full + chunk
+            ak = getattr(chunk, "additional_kwargs", {}) or {}
+            rc = ak.get("reasoning_content") or ak.get("reasoning") or ""
+            c = str(getattr(chunk, "content", "") or "")
+            if rc and not answer:
+                reasoning += str(rc)
+                yield {"reasoning": str(rc)}
+            if c:
+                answer += c
+                yield {"token": c}
+        if not answer and reasoning:      # thinking model ที่ส่งมาแต่ reasoning
+            answer = reasoning
+        if full is not None:
+            rag.track_usage(full)
+    else:
+        resp = rag.invoke_retry(llm, messages,
+                                ok_fn=lambda c: not rag.looks_truncated(c), label="answer")
+        answer = str(resp.content)
+        ak = getattr(resp, "additional_kwargs", {}) or {}
+        reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+        yield {"token": answer}
+    return answer, reasoning
+
+
+def _answer_compare(llm, question: str, num: str, history: list,
+                    stream: bool, t0: float) -> Iterator[dict]:
+    """เส้นทางเปรียบเทียบ: ไล่ตัวบทมาตรา num ข้ามทุกฉบับ -> ให้ LLM ชี้ว่าอะไรเปลี่ยนเมื่อไร
+    ไม่ใช้ embedding/BM25/rerank เลย — ดึงจาก metadata ตรง ๆ จึงไม่มีทางพลาดมาตรา"""
+    yield {"stage": f"ไล่ตัวบทมาตรา {num} ข้ามทุกฉบับ"}
+    points = rag.article_timeline(num)
+    yield {"meta": {"groups": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
+                    "n_sources": len(points), "search_q": "",
+                    "compare_article": num, "n_changes": max(0, len(points) - 1)}}
+
+    yield {"stage": "เขียนคำตอบ"}
+    n = len(points)
+    intro = (f"ตัวบท 'มาตรา {num}' ทุกรุ่นที่เนื้อหาเปลี่ยนจริง เรียงจากเก่าไปใหม่ "
+             f"(พบ {n} รุ่น = ถูกแก้ {max(0, n - 1)} ครั้ง):")
+    messages = [
+        SystemMessage(content=rag.COMPARE_SYSTEM),
+        HumanMessage(content=f"{intro}\n\n{rag.format_comparison(num, points)}\n\n"
+                             f"================\nคำถาม: {question}"),
+    ]
+    answer, reasoning = yield from _stream_answer(llm, messages, stream)
+    yield {"final": {"answer": answer, "chunks": points, "reasoning": reasoning,
+                     "groups_used": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
+                     "elapsed": time.perf_counter() - t0, "search_q": ""}}
+
+
 # ── core pipeline (generator — ไม่ผูก UI) ─────────────────────────────────────
 def answer_stream(llm, question: str, *, auto_group: bool = True,
                   all_groups: Optional[list[str]] = None,
@@ -218,7 +297,15 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
         yield {"stage": "เข้าใจคำถามต่อเนื่อง"}
         search_q = rewrite_followup(llm, question, history)
 
-    # 1) เลือกกลุ่มเอกสาร — ใช้กฎในโค้ด ไม่ใช่ LLM (ดูเหตุผลใน pick_groups)
+    # 1) แยกเส้นทาง: คำถามเปรียบเทียบ/ประวัติของ "มาตราหนึ่ง ๆ" ใช้กลไกคนละแบบ
+    #    เส้นทางปกติยุบเวอร์ชันซ้ำทิ้งเพื่อตอบว่ากฎหมายว่าอย่างไร ซึ่งทำลายข้อมูลที่การ
+    #    เปรียบเทียบต้องใช้พอดี → ที่นี่จึงไปดึงตัวบทตามเลขมาตราตรง ๆ ข้าม RRF ทั้งหมด
+    cmp_article = detect_compare(search_q)
+    if cmp_article:
+        yield from _answer_compare(llm, question, cmp_article, history, stream, t0)
+        return
+
+    # 2) เลือกกลุ่มเอกสาร — ใช้กฎในโค้ด ไม่ใช่ LLM (ดูเหตุผลใน pick_groups)
     #    เลือกเองจาก UI (manual) ชนะเสมอ — ผู้ใช้รู้ว่าตัวเองต้องการอะไร
     if not auto_group and manual_groups:
         groups_used, auto_years, versions = manual_groups, [], []
@@ -247,39 +334,9 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
                         else AIMessage(content=t["content"]))
     messages.append(HumanMessage(content=build_user_prompt(question, context, domain)))
 
-    # 5) ตอบ (stream = yield ทีละ token)
+    # 5) ตอบ (stream = yield ทีละ token) — ใช้ตัวเดียวกับเส้นทางเปรียบเทียบ
     yield {"stage": "เขียนคำตอบ"}
-    answer, reasoning = "", ""
-    if stream:
-        full = None
-        try:
-            gen = llm.stream(messages, stream_usage=True)
-        except TypeError:
-            gen = llm.stream(messages)
-        for chunk in gen:
-            full = chunk if full is None else full + chunk
-            ak = getattr(chunk, "additional_kwargs", {}) or {}
-            rc = ak.get("reasoning_content") or ak.get("reasoning") or ""
-            c = str(getattr(chunk, "content", "") or "")
-            if rc and not answer:
-                reasoning += str(rc)
-                yield {"reasoning": str(rc)}
-            if c:
-                answer += c
-                yield {"token": c}
-        if not answer and reasoning:      # thinking model ที่ส่งมาแต่ reasoning
-            answer = reasoning
-        if full is not None:
-            rag.track_usage(full)
-    else:
-        resp = rag.invoke_retry(
-            llm, messages,
-            ok_fn=lambda c: not rag.looks_truncated(c), label="answer",
-        )
-        answer = str(resp.content)
-        ak = getattr(resp, "additional_kwargs", {}) or {}
-        reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
-        yield {"token": answer}
+    answer, reasoning = yield from _stream_answer(llm, messages, stream)
 
     yield {"final": {"answer": answer, "chunks": chunks, "reasoning": reasoning,
                      "groups_used": groups_used, "elapsed": time.perf_counter() - t0,

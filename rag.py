@@ -211,7 +211,10 @@ def parse_doc_name(path: str) -> dict:
 # ── สกัด metadata ละเอียดจากตัวข้อความ ────────────────────────────────────────
 # เก็บให้ละเอียดที่สุดเพราะทุกฟิลด์ = ช่องทางกรอง/จัดอันดับที่แม่นกว่าการเดาจาก embedding
 # "มาตรา ๙", "มาตรา ๙/๑", "มาตรา ๘ ทวิ" — หัวข้อมาตราทุกแบบที่กฎหมายไทยใช้
-_ART_RE = re.compile(r"มาตรา\s*([๐-๙\d]+(?:/[๐-๙\d]+)?)\s*(ทวิ|ตรี|จัตวา|เบญจ|ฉ|สัตต|อัฏฐ|นว|ทศ)?")
+# ⚠️ ต้องมี lookahead กันคำที่ขึ้นต้นเหมือนเลขลำดับ — "มาตรา ๙๗ ฉบับดั้งเดิม" ต้องอ่านว่า
+#    มาตรา ๙๗ ไม่ใช่ "มาตรา ๙๗ ฉ" (ฉ = ลำดับที่ ๖) ที่ไปกินคำว่า "ฉบับ" เข้ามา
+_ART_ORD = r"(?:ทวิ|ตรี|จัตวา|เบญจ|ฉ|สัตต|อัฏฐ|นว|ทศ)(?![฀-๏])"
+_ART_RE = re.compile(rf"มาตรา\s*([๐-๙\d]+(?:/[๐-๙\d]+)?)\s*({_ART_ORD})?")
 # หัวโครงสร้าง: หมวด ๑ / ภาค ๒ / ส่วนที่ ๓ / ลักษณะ ๑
 _SEC_RE = re.compile(r"(หมวด|ภาค|ส่วนที่|ลักษณะ|บรรพ)\s*([๐-๙\d]+)")
 # การอ้างถึงมาตราอื่น: "ตามมาตรา ๙๔", "แห่งมาตรา ๘", "ในมาตรา ๙๗ หรือมาตรา ๙๘"
@@ -446,6 +449,23 @@ def extract_year(text: str, year_re=None) -> int:
 PUBLISH_STAMP_YEAR = int(os.environ.get("PUBLISH_STAMP_YEAR", "2565"))
 
 
+# ฉบับรวมสะสมแต่ละไฟล์ปิดท้ายด้วยรายการ "พ.ร.บ.แก้ไขเพิ่มเติมฯ (ฉบับที่ N) พ.ศ. YYYY"
+# ที่รวมไว้ — ตัวสุดท้ายในรายการคือจุดเวลาของไฟล์นั้น แม่นกว่าเดาจาก "ปีสูงสุดในเอกสาร"
+# มาก เพราะเอกสารทุกฉบับมีเชิงอรรถอ้างถึงฉบับแก้ในอนาคตปะปนอยู่
+_AMEND_ENTRY_RE = re.compile(
+    r"แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน\s*\(ฉบับที่\s*([๐-๙\d]+)\)\s*พ\.ศ\.\s*([๐-๙\d]+)")
+# ฉบับ v1–v5 เก่ากว่ารายการแรกที่จับได้ (ฉบับที่ ๒ พ.ศ. ๒๕๒๑) จึงต้องมีเพดานกัน
+# ไม่ให้ heuristic เดิมดันปีไปไกลเกินจริง
+_EARLY_YEAR_CAP = 2520
+
+
+def amend_level(text: str) -> tuple[int, int]:
+    """ฉบับแก้ไขล่าสุดที่เอกสารนี้รวมไว้ -> (เลขฉบับ, พ.ศ.) | (0, 0) ถ้าไม่พบ"""
+    got = [(int(a.translate(THAI_DIGITS)), int(b.translate(THAI_DIGITS)))
+           for a, b in _AMEND_ENTRY_RE.findall(text or "")]
+    return max(got) if got else (0, 0)
+
+
 def doc_label(meta: dict, year: int) -> str:
     """ชื่ออ่านง่ายของเอกสาร ใช้อ้างอิงใน context ที่ส่งให้ LLM และในหน้า sources"""
     v, kind = meta.get("version", -1), meta.get("kind", "")
@@ -495,11 +515,13 @@ def load_pdf_chunks() -> list[dict]:
         year = extract_year(recs[0]["text"] if recs else "", yre) or extract_year(src, yre)
         # ปีที่ตัวบทในไฟล์นี้สะท้อน — ปีสูงสุดที่เอ่ยถึงทั้งไฟล์ ตัดปีที่กฤษฎีกาประทับ
         # ตอนพิมพ์เอกสารออก (โผล่ทุกไฟล์เท่ากันหมด จึงแยกฉบับไม่ได้ ต้องตัดทิ้ง)
-        as_of = 0
+        as_of, amend_no = 0, 0
         if meta["kind"] == "update":
-            ys = [y for y in detect_years(" ".join(r["text"] for r in recs))
-                  if y != PUBLISH_STAMP_YEAR]
-            as_of = max(ys) if ys else 0
+            full = " ".join(r["text"] for r in recs)
+            amend_no, as_of = amend_level(full)
+            if not as_of:      # ฉบับเก่ากว่ารายการแรกที่จับได้ -> ถอยไปใช้ปีสูงสุด แต่มีเพดาน
+                ys = [y for y in detect_years(full) if y != PUBLISH_STAMP_YEAR]
+                as_of = min(max(ys), _EARLY_YEAR_CAP) if ys else 0
         label = doc_label(meta, year or as_of)
         art_seq: dict[str, int] = {}   # นับ chunk ที่ n ของมาตราเดียวกัน (มาตรายาว = หลาย chunk)
         for i, r in enumerate(recs):
@@ -516,6 +538,7 @@ def load_pdf_chunks() -> list[dict]:
             r["is_scan"] = meta["is_scan"]      # มาจาก ImgPDF (OCR) หรือไม่
             r["in_force"] = meta["in_force"]    # ตัวบทที่ใช้บังคับอยู่จริงหรือไม่
             r["as_of_year"] = as_of             # ตัวบทนี้สะท้อนกฎหมาย ณ ปีไหน (0 = ไม่ทราบ)
+            r["amend_no"] = amend_no            # รวมถึงฉบับแก้ไขที่เท่าไร (0 = ไม่ทราบ)
             r["doc_label"] = label              # ชื่ออ่านง่ายสำหรับอ้างอิงในคำตอบ
             r.update(extract_article_meta(r["text"]))   # articles/article_nums/refs/section
         all_chunks.extend(recs)
@@ -925,8 +948,7 @@ def status_label(c: dict) -> str:
 # ⚠️ ห้ามเทียบ "ข้อความของ chunk" ข้ามฉบับ — ขอบ chunk ของแต่ละฉบับไม่ตรงกัน
 #    (เอกสารยาวไม่เท่ากัน จุดตัดจึงเลื่อน) ผลลัพธ์จะกลายเป็นเห็น "เปลี่ยนทุกฉบับ"
 #    ทั้งที่ตัวบทเหมือนกันเป๊ะ → ต้องตัดเอา "ตัวบทมาตรานั้นจริง ๆ" จากเอกสารเต็มมาเทียบ
-_ART_HEAD_RE = re.compile(
-    r"มาตรา\s+([๐-๙]+(?:/[๐-๙]+)?)\s*(ทวิ|ตรี|จัตวา|เบญจ|ฉ|สัตต|อัฏฐ|นว|ทศ)?")
+_ART_HEAD_RE = re.compile(rf"มาตรา\s+([๐-๙]+(?:/[๐-๙]+)?)\s*({_ART_ORD})?")
 # header/footer ที่กฤษฎีกาประทับทุกหน้า — ถ้าไม่ตัดจะกลายเป็นความต่างปลอม
 _DOC_NOISE_RE = re.compile(
     r"สำนักงานคณะกรรมการกฤษฎีกา|Office of the Council of State|\d\d/\d\d/\d\d\s+\d\d:\d\d")
@@ -936,10 +958,30 @@ _DOC_NOISE_RE = re.compile(
 _LAYOUT_NOISE_RE = re.compile(r"\[\d+\]|\|\s*\d+")
 
 
+def law_text_norm(body: str) -> str:
+    """ตัวบทล้วน ๆ — ตัดเลขหน้า/เชิงอรรถ/ช่องว่างทิ้ง เหลือเฉพาะตัวอักษรที่เป็นเนื้อกฎหมาย"""
+    return re.sub(r"\s+", "", _LAYOUT_NOISE_RE.sub(" ", body or ""))
+
+
 def law_text_key(body: str) -> str:
-    """ลายนิ้วมือของ 'ตัวบท' ล้วน ๆ — ตัดเลขหน้า/เชิงอรรถ/ช่องว่างทิ้งก่อน hash
-    ใช้ตัดสินว่ามาตรานี้ 'ถูกแก้จริง' หรือแค่ layout ของเอกสารเลื่อน"""
+    """ลายนิ้วมือของตัวบท (ใช้เทียบแบบเป๊ะ)"""
     return text_key(_LAYOUT_NOISE_RE.sub(" ", body or ""))
+
+
+# เทียบเป๊ะเข้มเกินไป: PDF ฉบับต่างกันมีเศษสระลอยหลุดมาไม่เหมือนกัน (เช่น 'ทั้ที่กึ่')
+# ทำให้มาตราที่ไม่ได้ถูกแก้ดูเหมือนเปลี่ยน (วัดได้ความเหมือน 99.4%)
+# การแก้ไขกฎหมายจริงเปลี่ยนถ้อยคำเป็นเรื่องเป็นราว ความเหมือนจะต่ำกว่านี้มาก
+LAW_SAME_RATIO = float(os.environ.get("LAW_SAME_RATIO", "0.99"))
+
+
+def same_law_text(a: str, b: str) -> bool:
+    """ตัวบทสองรุ่นนี้ถือว่า 'ไม่ถูกแก้' หรือไม่ — เทียบด้วยเกณฑ์ความเหมือน ไม่ใช่ตรงเป๊ะ"""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= LAW_SAME_RATIO
 
 _article_cache: dict[str, dict[str, str]] = {}
 
@@ -985,14 +1027,14 @@ def article_timeline(num: str) -> list[dict]:
             docs.setdefault((0 if c["kind"] == "main" else 1, int(c["version"])), c)
 
     out: list[dict] = []
-    last_key = None
+    last_key = ""
     for order in sorted(docs):
         c = docs[order]
         body = doc_articles(os.path.join(DATA_DIR, c["source"])).get(num)
         if not body:
             continue
-        tk = law_text_key(body)     # เทียบเฉพาะตัวบท ไม่นับเลขหน้า/เชิงอรรถ
-        if tk == last_key:          # ฉบับนี้ตัวบทเหมือนเดิม -> ไม่ใช่จุดเปลี่ยน ข้าม
+        tk = law_text_norm(body)          # เทียบเฉพาะตัวบท ไม่นับเลขหน้า/เชิงอรรถ
+        if same_law_text(tk, last_key):   # ตัวบทเหมือนเดิม -> ไม่ใช่จุดเปลี่ยน ข้าม
             # แต่ถ้าฉบับที่ข้ามคือฉบับที่ใช้บังคับอยู่ ต้องเลื่อนป้าย "ใช้บังคับ" มาที่จุดเปลี่ยนล่าสุด
             # (ตัวบทเดียวกันยังมีผลถึงวันนี้ ไม่ใช่ว่าจุดเปลี่ยนนั้นเลิกใช้แล้ว)
             if c.get("in_force") and out:
@@ -1001,6 +1043,7 @@ def article_timeline(num: str) -> list[dict]:
         last_key = tk
         out.append({
             "version": c["version"], "as_of_year": c.get("as_of_year", 0),
+            "amend_no": c.get("amend_no", 0),
             "doc_label": c.get("doc_label", ""), "in_force": c.get("in_force", False),
             "article": f"มาตรา {num}", "kind": c.get("kind", ""),
             "source": c.get("source", ""), "page_start": 0, "text": body,
@@ -1015,13 +1058,18 @@ def format_comparison(num: str, points: list[dict]) -> str:
         return f"(ไม่พบตัวบทของมาตรา {num} ในเอกสารที่มี)"
     blocks = []
     for i, p in enumerate(points, 1):
-        when = "ฉบับดั้งเดิม พ.ศ. ๒๔๙๗" if p["kind"] == "main" else f"พ.ศ. {p['as_of_year'] or '?'}"
-        tag = "✅ ใช้บังคับปัจจุบัน" if p["in_force"] else "ตัวบทเดิม"
-        blocks.append(
-            f"[รุ่นที่ {i}/{len(points)} | {when} | {tag} | {p['article']} | หน้า {p['page_start']}]\n"
-            f"{p['text']}"
-        )
+        blocks.append(f"[รุ่นที่ {i}/{len(points)} | {timeline_when(p)} | "
+                      f"{'✅ ใช้บังคับปัจจุบัน' if p['in_force'] else 'ตัวบทเดิม'}]\n{p['text']}")
     return "\n\n---\n\n".join(blocks)
+
+
+def timeline_when(p: dict) -> str:
+    """คำอธิบายจุดเวลาของรุ่นตัวบท — ระบุฉบับแก้ไขที่รวมไว้ถ้าทราบ"""
+    if p.get("kind") == "main":
+        return "ฉบับดั้งเดิม พ.ศ. ๒๔๙๗"
+    if p.get("amend_no"):
+        return f"หลังแก้ไขฉบับที่ {p['amend_no']} (พ.ศ. {p['as_of_year']})"
+    return f"ราว พ.ศ. {p.get('as_of_year') or '?'}"
 
 
 def format_context(chunks: list[dict]) -> str:
@@ -1060,6 +1108,23 @@ SYSTEM_PROMPT = (
     "    แต่ต้องระบุให้ชัดว่าเป็นตัวบท ณ ปีใด และอาจไม่ใช่ฉบับที่ใช้บังคับอยู่ในปัจจุบัน\n"
     "- ⚠️ บาง context มาจาก OCR อาจมีคำเพี้ยน — ตีความจากบริบทได้ แต่ห้ามแต่งเลขมาตรา/ตัวเลขขึ้นใหม่\n"
     "- ตอบเป็นภาษาไทยกระชับ ชัดเจน ตรงประเด็น"
+)
+
+
+# prompt เฉพาะเส้นทางเปรียบเทียบ — context ที่ได้เรียงตามเวลา ไม่ใช่ตามคะแนนความเกี่ยวข้อง
+# โจทย์จึงต่างจากการตอบปกติ: ต้องชี้ว่า "อะไรเปลี่ยน เมื่อไร" ไม่ใช่ "กฎหมายว่าอย่างไร"
+COMPARE_SYSTEM = (
+    "คุณคือผู้ช่วยวิเคราะห์ความเปลี่ยนแปลงของตัวบทกฎหมายไทย\n\n"
+    "context ที่ให้มาคือ 'ตัวบทมาตราเดียวกัน' หลายรุ่น เรียงตามเวลาจากเก่าไปใหม่ "
+    "โดยตัดรุ่นที่ข้อความไม่เปลี่ยนออกแล้ว — แต่ละบล็อกจึงเป็นจุดที่มาตรานี้ถูกแก้จริง\n\n"
+    "กฎสำคัญ:\n"
+    "- ตอบจาก context เท่านั้น ห้ามเดา ห้ามใช้ความรู้ภายนอก\n"
+    "- ชี้ให้ชัดว่า 'ถ้อยคำใดเปลี่ยนไปเป็นอะไร' โดยยกข้อความเดิมกับข้อความใหม่มาเทียบให้เห็น\n"
+    "- ระบุว่าการเปลี่ยนแต่ละครั้งเกิดตอนไหน (ตามที่หัวบล็อกบอก)\n"
+    "- ⚠️ คัดถ้อยคำ ตัวเลข เลขมาตรา ให้ตรงเป๊ะ ห้ามแก้/ปัด/เดา\n"
+    "- สรุปท้ายว่า 'ตัวบทที่ใช้บังคับปัจจุบัน' คือรุ่นไหน และต่างจากฉบับดั้งเดิมอย่างไร\n"
+    "- ถ้ามีบล็อกเดียว แปลว่ามาตรานี้ไม่เคยถูกแก้เลย ให้บอกตามนั้น\n"
+    "- ตอบเป็นภาษาไทย กระชับ เป็นลำดับเวลา"
 )
 
 
