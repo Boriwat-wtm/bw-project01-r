@@ -70,7 +70,10 @@ DEFAULT_GROUP = "default"
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1500"))      # ตัวอักษรต่อ chunk (โดยประมาณ)
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "250")) # carry-over กันกฎถูกหั่นกลางข้อ
 OCR_MIN_CHARS = int(os.environ.get("OCR_MIN_CHARS", "25"))  # หน้าที่ข้อความน้อยกว่านี้ = สแกน → OCR
-TOP_K = 9              # chunk สุดท้ายที่ส่งให้ LLM (multi-query RRF-pooled → 9 ก้อน ~ครึ่งหน้า/ก้อน)
+# chunk สุดท้ายที่ส่งให้ LLM — วัดแล้วพบว่า retrieval หาเจอ 83% แต่ LLM ตอบถูกแค่ 53%
+# คือข้อมูลอยู่ใน context แล้วแต่ประกอบไม่ครบ โดยเฉพาะคำถามที่ต้องรวบรวมหลายมาตรา
+# → เพิ่มพื้นที่ให้ก่อน (12 ก้อน ~1,200 ตัวอักษร/ก้อน ยังห่างจากขีดจำกัด context มาก)
+TOP_K = int(os.environ.get("TOP_K", "12"))
 
 # ── Cross-encoder reranker (เปิดด้วย env RAG_RERANK=1 หรือ flag --rerank) ─────────
 # pipeline: retrieve กว้าง (RRF) → เก็บ top-N → cross-encoder ให้คะแนน (query,chunk) → top-K
@@ -268,14 +271,21 @@ def head_article_num(article_label: str) -> str:
     return _art_num(m.group(1), m.group(2) or "") if m else ""
 
 
+# (C) มาตราที่ถูก "เปลี่ยนเลข" ตอนแก้ไข — ค้นด้วยเลขเก่าต้องเจอเลขใหม่ด้วย
+# ฉ.๑๑ ยกเลิก "มาตรา ๙ ทวิ" แล้วใส่ความใหม่ในชื่อ "มาตรา ๙/๑" (เปลี่ยนจากระบบ ทวิ/ตรี
+# มาเป็นระบบทับ) ถ้าไม่ทำ alias ผู้ใช้ที่ถามด้วยเลขเก่าจะได้คำตอบว่า "ไม่พบ" ทั้งที่มีอยู่
+ARTICLE_ALIASES = {"9 ทวิ": "9/1"}
+
+
 def question_articles(question: str) -> list[str]:
     """เลขมาตราที่ผู้ใช้ระบุในคำถาม -> ['9', '9/1'] ([] = ไม่ได้ระบุ)
     รองรับทั้ง 'มาตรา ๙' และ 'มาตรา 9' (normalize เป็นอารบิกทั้งคู่)"""
     out: list[str] = []
     for m in _ART_RE.finditer(question or ""):
         n = _art_num(m.group(1), m.group(2) or "")
-        if n not in out:
-            out.append(n)
+        for x in (n, ARTICLE_ALIASES.get(n)):    # ถามเลขเก่า -> ค้นเลขใหม่ให้ด้วย
+            if x and x not in out:
+                out.append(x)
     return out
 
 
@@ -305,24 +315,38 @@ def _load_pdf(path: str, domain: str = "thai_law") -> list[dict]:
 
     recs: list[dict] = []
     buf: list[str] = []
+    buf_arts: list[str] = []      # มาตราที่ครอบบรรทัดนั้น ๆ (ยาวเท่า buf เสมอ)
     buf_len = 0
     cur_article = ""
     page_start = 1
 
+    def dominant_article() -> str:
+        """มาตราที่กินเนื้อที่มากที่สุดใน buffer = 'chunk นี้ว่าด้วยมาตราอะไร'
+
+        ⚠️ ห้ามใช้ cur_article ตอน flush เป็นป้าย — นั่นคือหัวมาตรา 'ล่าสุดที่เพิ่งเจอ'
+        ซึ่งมักเป็นมาตราท้าย chunk วัดแล้วชี้ผิดถึง 81% เพราะ 1 chunk มีหลายมาตรา
+        (4 มาตราขึ้นไปถึง 47%) การนับตามความยาวจึงตรงกับ 'เนื้อหาหลัก' กว่า"""
+        by: dict[str, int] = {}
+        for ln, art in zip(buf, buf_arts):
+            if art:
+                by[art] = by.get(art, 0) + len(ln)
+        return max(by, key=lambda a: by[a]) if by else ""
+
     def flush(page_end: int):
-        nonlocal buf, buf_len, page_start
+        nonlocal buf, buf_arts, buf_len, page_start
         text = "\n".join(buf).strip()
         if len(text) > 40:
-            recs.append({"text": text, "article": cur_article,
+            recs.append({"text": text, "article": dominant_article(),
                          "page_start": page_start, "page_end": page_end})
-        # overlap: เก็บท้าย buffer ไว้ต่อ chunk ถัดไป
-        tail, tlen = [], 0
-        for ln in reversed(buf):
+        # overlap: เก็บท้าย buffer ไว้ต่อ chunk ถัดไป (ยกป้ายมาตราของบรรทัดนั้นไปด้วย)
+        tail, tail_arts, tlen = [], [], 0
+        for ln, art in zip(reversed(buf), reversed(buf_arts)):
             if tlen + len(ln) > CHUNK_OVERLAP:
                 break
             tail.insert(0, ln)
+            tail_arts.insert(0, art)
             tlen += len(ln)
-        buf = tail
+        buf, buf_arts = tail, tail_arts
         buf_len = tlen
         page_start = page_end
 
@@ -354,6 +378,7 @@ def _load_pdf(path: str, domain: str = "thai_law") -> list[dict]:
                 elif m_sec:
                     cur_article = prof["section_fmt"](m_sec)
                 buf.append(ln)
+                buf_arts.append(cur_article)
                 buf_len += len(ln)
                 if buf_len >= CHUNK_SIZE:
                     flush(pno)
@@ -1039,6 +1064,127 @@ def doc_articles(path: str) -> dict[str, str]:
     return out
 
 
+# ── (A) Amendment graph — ใครแก้มาตราไหน เมื่อไร ทับงานของใคร ────────────────
+# ตัวบทไทยเขียนสายการแก้ไขไว้ในตัวเองด้วยรูปแบบตายตัว:
+#   "ให้ยกเลิกความในมาตรา ๖๑ ... ซึ่งแก้ไขเพิ่มเติมโดย <ฉบับก่อนหน้า> และให้ใช้ความต่อไปนี้แทน"
+# ดึงด้วย regex ได้แม่นเกือบ 100% และฟรี — ดีกว่าให้ LLM ไล่เอง ซึ่งทั้งช้าและเดาผิดได้
+# พอมีกราฟแล้ว multi-hop = เดินกราฟ ไม่ต้องยิง LLM ซ้ำหลายรอบ
+_CLAUSE_RE = re.compile(
+    r"(?:ให้ยกเลิกความใน|ยกเลิกความใน|ให้ยกเลิก|เพิ่มความต่อไปนี้เป็น)\s*"
+    rf"(?:วรรค\S+\s*(?:และวรรค\S+\s*)?ของ\s*)?มาตรา\s*([๐-๙]+(?:/[๐-๙]+)?)\s*({_ART_ORD})?"
+    r"([^“]{0,200})")
+# <ฉบับก่อนหน้า> มี 3 รูปแบบ — ต้องรับให้ครบ ไม่งั้นสายขาดกลาง
+_PREV_PB_NO = re.compile(r"แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน\s*\(ฉบับที่\s*([๐-๙]+)\)\s*พ\.ศ\.\s*([๐-๙]+)")
+# ⚠️ ฉบับแรกไม่มีคำว่า "(ฉบับที่ ๑)" ในชื่อ — ถ้าจับแต่แบบมีเลข สายของ ม.๖๙ ทวิ จะขาด
+_PREV_PB_Y = re.compile(r"แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน\s*พ\.ศ\.\s*([๐-๙]+)")
+_PREV_REV = re.compile(r"ประกาศของคณะปฏิวัติ\s*ฉบับที่\s*([๐-๙]+)[^พ]{0,40}พ\.ศ\.\s*([๐-๙]+)")
+
+_graph_cache: "dict | None" = None
+
+
+def _parse_prev(tail: str) -> "dict | None":
+    """แกะ '<ฉบับก่อนหน้า>' จากข้อความท้าย clause — None = แก้ทับตัวบทเดิม พ.ศ. ๒๔๙๗"""
+    if "แก้ไขเพิ่มเติมโดย" not in tail.replace(" ", ""):
+        return None
+    m = _PREV_REV.search(tail)
+    if m:
+        return {"kind": "ปว.", "no": int(m.group(1).translate(THAI_DIGITS)),
+                "year": int(m.group(2).translate(THAI_DIGITS)),
+                "label": f"ประกาศของคณะปฏิวัติ ฉบับที่ {m.group(1)}", "in_corpus": False}
+    m = _PREV_PB_NO.search(tail)
+    if m:
+        n, y = (int(x.translate(THAI_DIGITS)) for x in m.groups())
+        return {"kind": "พ.ร.บ.", "no": n, "year": y,
+                "label": f"พ.ร.บ.แก้ไขเพิ่มเติมฯ (ฉบับที่ {m.group(1)}) พ.ศ. {m.group(2)}",
+                "in_corpus": True}
+    m = _PREV_PB_Y.search(tail)
+    if m:                                   # ไม่มีเลขฉบับ = ฉบับที่ ๑ (ธรรมเนียมการร่าง)
+        y = int(m.group(1).translate(THAI_DIGITS))
+        return {"kind": "พ.ร.บ.", "no": 1, "year": y,
+                "label": f"พ.ร.บ.แก้ไขเพิ่มเติมฯ พ.ศ. {m.group(1)} (ฉบับที่ ๑)",
+                "in_corpus": True}
+    return {"kind": "อื่น", "no": 0, "year": 0, "label": "กฎหมายอื่น", "in_corpus": False}
+
+
+def amendment_graph() -> dict:
+    """{เลขมาตรา (อารบิก): [รายการการถูกแก้ เรียงเก่า->ใหม่]}
+    แต่ละรายการ = {by, year, amend_no, over} — over = ฉบับที่ถูกแก้ทับ (None = ตัวบทเดิม)"""
+    global _graph_cache
+    if _graph_cache is not None:
+        return _graph_cache
+    _ensure_loaded()
+    src = {}                     # (amend_no) -> (year, source file)
+    for c in _chunks:
+        if c.get("kind") == "amend" and not c.get("is_scan"):
+            src.setdefault(int(c["version"]), (int(c.get("year", 0) or 0), c["source"]))
+
+    g: dict[str, list[dict]] = {}
+    for no in sorted(src):
+        year, fname = src[no]
+        import fitz
+        doc = fitz.open(os.path.join(DATA_DIR, fname))
+        try:
+            text = " ".join("".join(doc[i].get_text()
+                                    for i in range(doc.page_count)).split())
+        finally:
+            doc.close()
+        for m in _CLAUSE_RE.finditer(text):
+            art = _art_num(m.group(1), m.group(2) or "")
+            prev = _parse_prev(m.group(3))
+            entry = {"by": f"ฉบับที่ {no}", "amend_no": no, "year": year, "over": prev}
+            lst = g.setdefault(art, [])
+            if not any(e["amend_no"] == no for e in lst):
+                lst.append(entry)
+    for art, lst in g.items():
+        lst.sort(key=lambda e: (e["year"], e["amend_no"]))
+    _graph_cache = g
+    return g
+
+
+def article_chain(num: str) -> list[dict]:
+    """สายการแก้ไขเต็มของมาตรา num เรียงเก่า -> ใหม่ (รวมต้นสายที่อยู่นอก corpus)
+    ตอบคำถามแนว 'ถูกแก้กี่ครั้ง / ก่อนหน้าของก่อนหน้าคือฉบับใด' ได้แบบไม่ต้องเดา"""
+    lst = amendment_graph().get(num, [])
+    if not lst:
+        return []
+    out: list[dict] = []
+    first_prev = lst[0].get("over")
+    if first_prev:                       # ต้นสาย เช่น ปว.๓๓๔ (อาจอยู่นอก corpus)
+        out.append({"label": first_prev["label"], "year": first_prev["year"],
+                    "in_corpus": first_prev["in_corpus"]})
+    else:
+        out.append({"label": "ตัวบทเดิม ประมวลกฎหมายที่ดิน พ.ศ. ๒๔๙๗",
+                    "year": 2497, "in_corpus": True})
+    for e in lst:
+        out.append({"label": f"พ.ร.บ.แก้ไขเพิ่มเติมฯ (ฉบับที่ {e['amend_no']}) พ.ศ. {e['year']}",
+                    "year": e["year"], "in_corpus": True})
+    return out
+
+
+def articles_amended_by(amend_no: int) -> list[dict]:
+    """มาตราทั้งหมดที่ 'ฉบับที่ N' แก้ พร้อมบอกว่าแก้ทับงานของใคร
+    ใช้ตอบคำถามเชิงรวบรวม เช่น 'ฉบับที่ ๔ แก้ทับ พ.ร.บ.ฉบับก่อนที่มาตราใดบ้าง'"""
+    out = []
+    for art, lst in amendment_graph().items():
+        for e in lst:
+            if e["amend_no"] == amend_no:
+                out.append({"article": art, "over": e["over"]})
+    return sorted(out, key=lambda x: (len(x["article"]), x["article"]))
+
+
+def format_chain(num: str, chain: list[dict]) -> str:
+    """สายการแก้ไขเป็นข้อความให้ LLM อ่าน — ระบุชัดว่าอันไหนอยู่นอก corpus
+    เพื่อให้ตอบได้ว่า 'ปลายสายคือ ปว.๓๓๔' โดยไม่แต่งเนื้อหาของ ปว.๓๓๔ ขึ้นมาเอง"""
+    if not chain:
+        return ""
+    lines = [f"สายการแก้ไขของมาตรา {num} (เรียงเก่า -> ใหม่) "
+             f"— ถูกแก้ {len(chain) - 1} ครั้ง:"]
+    for i, c in enumerate(chain):
+        tag = "" if c["in_corpus"] else "  [เอกสารอยู่นอกชุดข้อมูลนี้ — ห้ามแต่งเนื้อหา]"
+        lines.append(f"  {i + 1}. {c['label']}{tag}")
+    return "\n".join(lines)
+
+
 def article_timeline(num: str) -> list[dict]:
     """ไล่ตัวบท 'มาตรา num' ข้ามทุกฉบับตามลำดับเวลา แล้วยุบช่วงที่ตัวบทไม่เปลี่ยน
     คืนเฉพาะ 'จุดที่เนื้อหาเปลี่ยนจริง' -> [{version, as_of_year, doc_label, text, in_force}]
@@ -1129,6 +1275,9 @@ SYSTEM_PROMPT = (
     "- ถ้าถามการตีความ/ผลทางกฎหมาย: สรุปตัวบทที่เกี่ยวข้องก่อน แล้ววิเคราะห์ต่อจากตัวบทนั้น (ขึ้นต้น 'วิเคราะห์:')\n"
     "- ให้ตอบ 'ไม่พบข้อมูลนี้ในเอกสารที่ค้นเจอ' เฉพาะเมื่อ 'ตัวบท/ข้อเท็จจริงที่ถามโดยตรง' ไม่มีใน context จริง ๆ\n"
     "- ถ้าตัวบทอ้างถึงมาตราอื่น (cross-reference) ให้ระบุเลขมาตราที่อ้างถึงด้วย\n"
+    "- ⚠️ ถ้าคำถามเป็นแบบ 'มีอะไรบ้าง/กี่ฉบับ/มาตราใดบ้าง' ให้ไล่ทุกรายการที่พบใน context\n"
+    "  ให้ครบทุกตัว พร้อมเลขมาตราและปี ห้ามยกมาแค่ตัวอย่างแล้วสรุปรวบ\n"
+    "  ถ้า context มีข้อมูลไม่ครบ ให้บอกว่าเจอเท่าไรและอาจมีมากกว่านี้\n"
     "- หัวบล็อกบอกสถานะตัวบท ใช้ตัดสินว่าจะเชื่อบล็อกไหน — ห้ามคัดลอก '✅'/'⚠️' ลงในคำตอบ\n"
     "  · ถ้ามีทั้งบล็อก '✅ ใช้บังคับปัจจุบัน' และ '⚠️' ที่เนื้อหาขัดกัน ให้ตอบตามบล็อก ✅\n"
     "    แล้วบอกสั้น ๆ ว่าตัวบทเดิมต่างอย่างไร\n"
@@ -1147,6 +1296,9 @@ COMPARE_SYSTEM = (
     "โดยตัดรุ่นที่ข้อความไม่เปลี่ยนออกแล้ว — แต่ละบล็อกจึงเป็นจุดที่มาตรานี้ถูกแก้จริง\n\n"
     "กฎสำคัญ:\n"
     "- ตอบจาก context เท่านั้น ห้ามเดา ห้ามใช้ความรู้ภายนอก\n"
+    "- ⚠️ ถ้ามีบล็อก 'สายการแก้ไข' ให้ยึดตามนั้นเป็นคำตอบเรื่องลำดับ/จำนวนครั้ง/ฉบับที่แก้\n"
+    "  และต้อง**ระบุชื่อและปีของทุกฉบับในสาย**ให้ครบ ห้ามข้าม ห้ามสรุปรวบ\n"
+    "  รายการที่กำกับว่าอยู่นอกชุดข้อมูล ให้เอ่ยชื่อได้ แต่ห้ามบรรยายเนื้อหาของมัน\n"
     "- ชี้ให้ชัดว่า 'ถ้อยคำใดเปลี่ยนไปเป็นอะไร' โดยยกข้อความเดิมกับข้อความใหม่มาเทียบให้เห็น\n"
     "- ระบุว่าการเปลี่ยนแต่ละครั้งเกิดตอนไหน (ตามที่หัวบล็อกบอก)\n"
     "- ⚠️ คัดถ้อยคำ ตัวเลข เลขมาตรา ให้ตรงเป๊ะ ห้ามแก้/ปัด/เดา\n"
@@ -1179,8 +1331,13 @@ EXPAND_MULTI_SYSTEM = (
 # ══════════════════════════════════════════════════════════════════════════════
 # CHUNKING PROFILE — กฎหมายไทย (โปรเจกต์นี้เป็นกฎหมายล้วน ไม่มี multi-domain)
 # ══════════════════════════════════════════════════════════════════════════════
-# หน่วยตัด chunk: "มาตรา ๕" / "ข้อ ๓" (เลขไทย ๐-๙ หรืออารบิก; เลขอาจอยู่คนละบรรทัดถ้ามาจาก OCR → optional)
-_TH_MAJOR_RE = re.compile(r"^\s*(มาตรา|ข้อ)\s*([๐-๙\d]+(?:/[๐-๙\d]+)?)?\b")
+# หน่วยตัด chunk: "มาตรา ๕" / "ข้อ ๓" / "มาตรา ๘ ตรี" / "มาตรา ๙/๑"
+# (เลขไทย ๐-๙ หรืออารบิก; เลขอาจอยู่คนละบรรทัดถ้ามาจาก OCR → optional)
+# ⚠️ ต้องเก็บลำดับ ทวิ/ตรี ด้วย ไม่งั้น "มาตรา ๘ ตรี" จะได้ป้ายว่า "มาตรา ๘" ซึ่ง
+#    ไม่ตรงกับ article_nums ที่สกัดจากตัวข้อความ (เก็บเป็น "8 ตรี") — ป้ายกับ metadata
+#    ต้องใช้กติกาเดียวกัน ไม่งั้นตัวดันมาตราที่ถูกถามจะเทียบไม่ติด
+_TH_MAJOR_RE = re.compile(
+    rf"^\s*(มาตรา|ข้อ)\s*([๐-๙\d]+(?:/[๐-๙\d]+)?)?\s*({_ART_ORD})?\b")
 # หัวโครงสร้าง (บริบท): หมวด / ภาค / ส่วนที่ / ลักษณะ / บรรพ
 _TH_SECTION_RE = re.compile(r"^\s*(หมวด|ภาค|ส่วนที่|ลักษณะ|บรรพ)\s*([๐-๙\d]+)?")
 # header/footer ราชกิจจานุเบกษา ที่ซ้ำทุกหน้า
@@ -1193,8 +1350,13 @@ _TH_HEADER_RE = [
 
 
 def _th_label(m) -> str:
-    """'มาตรา ๕' / 'หมวด ๑' (ถ้ามีเลข) หรือแค่ 'มาตรา' (เผื่อ OCR แยกเลขคนละบรรทัด)"""
-    return f"{m.group(1)} {m.group(2)}".strip() if m.lastindex and m.group(2) else m.group(1)
+    """'มาตรา ๕' / 'มาตรา ๘ ตรี' / 'หมวด ๑' — หรือแค่ 'มาตรา' ถ้าเลขอยู่คนละบรรทัด (OCR)"""
+    parts = [m.group(1)]
+    if m.lastindex and m.lastindex >= 2 and m.group(2):
+        parts.append(m.group(2))
+        if m.lastindex >= 3 and m.group(3):    # ลำดับ ทวิ/ตรี (มีเฉพาะ major_re)
+            parts.append(m.group(3))
+    return " ".join(parts)
 
 
 # โปรไฟล์เดียว = กฎหมายไทย (ยังคงชื่อ DOMAINS/domain ไว้เพื่อไม่ต้องแก้ pipeline ที่อ้างถึง)

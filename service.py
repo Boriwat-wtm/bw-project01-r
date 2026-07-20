@@ -60,7 +60,9 @@ _HISTORY_HINT = re.compile(
 _COMPARE_HINT = re.compile(
     r"ต่างกัน|ต่างจาก|แตกต่าง|เปรียบเทียบ|เทียบ|ก่อนและหลัง|ก่อนกับหลัง|"
     r"ถูกแก้|เคยแก้|แก้ไขกี่|กี่ครั้ง|แก้เมื่อไร|แก้ไขเมื่อไร|ประวัติการแก้|"
-    r"เปลี่ยนไปอย่างไร|เปลี่ยนแปลงอย่างไร"
+    r"เปลี่ยนไปอย่างไร|เปลี่ยนแปลงอย่างไร|"
+    # คำถามแนวไล่สาย (chain) — "ก่อนหน้าของก่อนหน้า", "ฉบับใดบ้าง", "ที่มาอย่างไร"
+    r"ก่อนหน้า|กี่ฉบับ|ฉบับใดบ้าง|ฉบับไหนบ้าง|ลำดับเวลา|ที่มาอย่างไร|มีที่มา|ยังมีอยู่"
 )
 
 
@@ -259,18 +261,38 @@ def _answer_compare(llm, question: str, num: str, history: list,
     ไม่ใช้ embedding/BM25/rerank เลย — ดึงจาก metadata ตรง ๆ จึงไม่มีทางพลาดมาตรา"""
     yield {"stage": f"ไล่ตัวบทมาตรา {num} ข้ามทุกฉบับ"}
     points = rag.article_timeline(num)
+    # สายการแก้ไขจาก amendment graph — ระบุ "ใครแก้ เมื่อไร ทับงานของใคร" แบบชี้ขาด
+    # ต่างจาก timeline ที่บอกแค่ "ตัวบทเปลี่ยนตอนไหน" — สองอันนี้เสริมกัน
+    chain = rag.article_chain(num)
     yield {"meta": {"groups": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
                     "n_sources": len(points), "search_q": "",
-                    "compare_article": num, "n_changes": max(0, len(points) - 1)}}
+                    "compare_article": num, "n_changes": max(0, len(points) - 1),
+                    "chain_len": max(0, len(chain) - 1)}}
 
     yield {"stage": "เขียนคำตอบ"}
     n = len(points)
-    intro = (f"ตัวบท 'มาตรา {num}' ทุกรุ่นที่เนื้อหาเปลี่ยนจริง เรียงจากเก่าไปใหม่ "
-             f"(พบ {n} รุ่น = ถูกแก้ {max(0, n - 1)} ครั้ง):")
+    parts = []
+    # มาตรานี้ถูก "เปลี่ยนเลข" ตอนแก้ไขไหม — ต้องบอก LLM ตรง ๆ ไม่ใช่แค่เอาไปขยายคำค้น
+    # ไม่งั้นถามว่า "ม.๙ ทวิ ยังมีอยู่ไหม" จะตอบไม่ได้ว่ามันกลายเป็น ม.๙/๑
+    alias = rag.ARTICLE_ALIASES.get(num)
+    if alias:
+        parts.append(f"⚠️ มาตรา {num} ถูกยกเลิกแล้วบัญญัติใหม่ในชื่อ 'มาตรา {alias}' "
+                     f"(เปลี่ยนเลขมาตรา ไม่ใช่ถูกยกเลิกทิ้ง) — ตัวบทปัจจุบันอยู่ที่มาตรา {alias}")
+        alias_chain = rag.article_chain(alias)
+        if alias_chain:
+            parts.append(rag.format_chain(alias, alias_chain))
+        alias_pts = rag.article_timeline(alias)
+        if alias_pts:
+            parts.append(f"ตัวบทของมาตรา {alias} (ฉบับปัจจุบัน):\n\n"
+                         f"{rag.format_comparison(alias, alias_pts[-1:])}")
+    if chain:
+        parts.append(rag.format_chain(num, chain))
+    parts.append(f"ตัวบท 'มาตรา {num}' ทุกรุ่นที่เนื้อหาเปลี่ยนจริง เรียงจากเก่าไปใหม่ "
+                 f"(พบ {n} รุ่น):\n\n{rag.format_comparison(num, points)}")
     messages = [
         SystemMessage(content=rag.COMPARE_SYSTEM),
-        HumanMessage(content=f"{intro}\n\n{rag.format_comparison(num, points)}\n\n"
-                             f"================\nคำถาม: {question}"),
+        HumanMessage(content="\n\n".join(parts) +
+                             f"\n\n================\nคำถาม: {question}"),
     ]
     answer, reasoning = yield from _stream_answer(llm, messages, stream)
     yield {"final": {"answer": answer, "chunks": points, "reasoning": reasoning,
