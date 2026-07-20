@@ -506,10 +506,54 @@ def doc_label(meta: dict, year: int) -> str:
 
 
 def detect_years(text: str) -> list[int]:
-    """ดึงปีทั้งหมดที่เอ่ยถึงในคำถาม — [] = ไม่ระบุปี
-    ⚠️ ต้อง normalize เลขไทยก่อน คนไทยพิมพ์ 'ปี ๒๕๔๕' ไม่ใช่ 'ปี 2545'
-    (ปีที่ตรวจได้ = สัญญาณปลดล็อกค้นฉบับย้อนหลัง ถ้าพลาดตรงนี้ระบบจะไม่ยอมย้อนให้เลย)"""
+    """ดึงปีทั้งหมดที่เอ่ยถึงในข้อความ — ใช้กับ 'เอกสาร' (ดูปีของไฟล์)
+    สำหรับ 'คำถามผู้ใช้' ให้ใช้ classify_years() แทน เพราะปีในคำถามมีหลายความหมาย"""
     return sorted({int(y) for y in _YEAR_RE.findall((text or "").translate(THAI_DIGITS))})
+
+
+# ── ปีในคำถามมี 3 ความหมาย แยกไม่ออก = เสิร์ฟกฎหมายผิดเวอร์ชัน ────────────────
+#   "ฉบับที่ ๑๕ พ.ศ. ๒๕๖๒ บังคับใช้เมื่อใด"        -> ปีคือ 'ชื่อเอกสาร'
+#   "ที่ดินที่ออกใบจองหลังวันที่ ๑๔ ธ.ค. ๒๕๑๕..."  -> ปีคือ 'เงื่อนไขในตัวบท'
+#   "มาตรา ๒๐ ณ วันที่ ๑ ม.ค. ๒๕๖๒ ว่าอย่างไร"     -> ปีคือ 'คำขอย้อนเวลา' ✅ อันเดียวที่ควรย้อน
+# เดิมนับทุกปีเป็นคำขอย้อนเวลา ทำให้ถาม "ห้ามโอนกี่ปี" แล้วได้ตัวบทฉบับ ๒๕๐๘ มาตอบ
+_CITE_CUE = re.compile(r"ฉบับที่|พระราชบัญญัติ|พ\.ร\.บ\.|ประกาศ|ลงวันที่")
+_RULE_CUE = re.compile(r"หลัง|ก่อน|ตั้งแต่|นับแต่|ภายใน|ระหว่าง|พ้นกำหนด")
+_ASOF_CUE = re.compile(r"ณ\s*วันที่|ณ\s*ปี|ณ\s*พ\.ศ\.|ในปี|ตอนปี|เมื่อปี|สมัย|ขณะนั้น|ตอนนั้น|^\s*ปี|\bปี\s*(?:พ\.ศ\.)?\s*$")
+
+
+def classify_years(question: str) -> dict:
+    """แยกปีในคำถามตามความหมาย -> {'asof': [...], 'cite': [...], 'rule': [...]}
+    ดูบริบท ~28 ตัวอักษรก่อนหน้าปีนั้นเพื่อตัดสิน
+    ⚠️ ค่าเริ่มต้นเมื่อไม่แน่ใจ = ไม่ย้อนเวลา — ผิดไปทางกฎหมายปัจจุบันปลอดภัยกว่า"""
+    q = (question or "").translate(THAI_DIGITS)
+    out = {"asof": [], "cite": [], "rule": []}
+    for m in _YEAR_RE.finditer(q):
+        year, before = int(m.group(1)), q[max(0, m.start() - 28):m.start()]
+        if _CITE_CUE.search(before):
+            key = "cite"
+        elif _RULE_CUE.search(before):
+            key = "rule"
+        elif _ASOF_CUE.search(before) or not before.strip():
+            key = "asof"
+        else:
+            key = "rule"                      # ไม่มีสัญญาณชัด -> ไม่ย้อนเวลา
+        if year not in out[key]:
+            out[key].append(year)
+    return out
+
+
+_AMEND_REF_RE = re.compile(r"ฉบับที่\s*([๐-๙\d]+)")
+
+
+def question_amendments(question: str) -> list[int]:
+    """เลข 'ฉบับที่ N' ที่ผู้ใช้อ้างถึงในคำถาม -> [12]
+    เป็นสัญญาณที่ชัดที่สุดว่าคำตอบอยู่ในเอกสารฉบับแก้ไขไหน — 12 จาก 30 คำถามมีสัญญาณนี้"""
+    out = []
+    for m in _AMEND_REF_RE.finditer(question or ""):
+        n = int(m.group(1).translate(THAI_DIGITS))
+        if 1 <= n <= 50 and n not in out:      # เลขใหญ่ ๆ = อ้างกฎหมายอื่น (ปว.๓๓๔)
+            out.append(n)
+    return out
 
 
 def load_pdf_chunks() -> list[dict]:
@@ -815,6 +859,34 @@ def _demote_scans(chunks: list[dict]) -> list[dict]:
 BOOST_EXACT_ARTICLE = os.environ.get("RAG_ART_BOOST", "1") != "0"
 
 
+def _boost_amend(chunks: list[dict], nos: list[int]) -> list[dict]:
+    """ดึง chunk ของ 'พ.ร.บ.แก้ไขเพิ่มเติม ฉบับที่ N' ที่ผู้ใช้อ้างถึงขึ้นหัวแถว
+
+    ⚠️ ไม่ใช่แค่ดันของที่ค้นเจอ แต่ 'เติมเข้ามาเลย' ถ้ายังไม่อยู่ในผล — เพราะ boost
+    ช่วยได้เฉพาะ chunk ที่ติด pool มาแล้ว ถ้าไม่ติดตั้งแต่แรกก็ไม่มีอะไรให้ดัน
+    (เจอกับคำถาม 'ฉบับที่ ๑๑ เพิ่มมาตราใดเข้ามา' ที่ chunk คำตอบไม่เคยเข้า pool เลย)
+    พ.ร.บ.แก้ไขแต่ละฉบับมีแค่ 2-19 chunk จึงใส่ครบทั้งฉบับได้โดยไม่ท่วม context
+
+    ใช้ boost แทน filter เพราะบางคำถามอ้างเลขฉบับแต่ถามตัวบทปัจจุบัน
+    (เช่น 'มาตรา ๙๗ ที่แก้ไขโดยฉบับที่ ๖ ว่าอย่างไร') ถ้า filter จะตัดฉบับปัจจุบันทิ้ง"""
+    if not nos:
+        return chunks
+    want = set(nos)
+
+    def is_hit(c: dict) -> bool:
+        return c.get("kind") == "amend" and int(c.get("version", -1)) in want
+
+    hit = [c for c in chunks if is_hit(c)]
+    seen = {c["id"] for c in hit}
+    for c in _chunks:                    # เติมส่วนที่ยังขาดจากดัชนีเต็ม
+        if is_hit(c) and c["id"] not in seen and not c.get("is_scan"):
+            hit.append(c)
+            seen.add(c["id"])
+    hit.sort(key=lambda c: (int(c.get("version", 0)), c.get("page_start", 0),
+                            c.get("art_seq", 0)))
+    return hit + [c for c in chunks if not is_hit(c)]
+
+
 def _boost_exact_article(chunks: list[dict], wanted: list[str]) -> list[dict]:
     """ดัน chunk ที่ 'ขึ้นต้นด้วย' มาตราที่ถูกถามขึ้นหัวแถว คงลำดับเดิมภายในกลุ่ม
     3 ชั้น: ป้ายมาตราของ chunk ตรง > มาตรานั้นปรากฏใน chunk > ที่เหลือ
@@ -960,14 +1032,18 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
     if DEDUPE_VERSIONS:            # ยุบก่อนตัด k → ไม่เสีย slot ให้ฉบับเก่าที่เนื้อหาซ้ำ
         ranked = _dedupe_versions(ranked)
     ranked = _demote_scans(ranked)  # ดัน OCR ท้ายแถวก่อนตัด pool → reranker เห็นแต่ตัวบทที่สะอาด
-    # เลขมาตราที่ผู้ใช้ระบุมาเอง — ดูจากคำถามจริง (rerank_query) ไม่ใช่ query ที่ LLM ขยาย
-    wanted = question_articles(rerank_query or (query if isinstance(query, str) else ""))
+    # สัญญาณที่ผู้ใช้ระบุมาเอง — ดูจากคำถามจริง (rerank_query) ไม่ใช่ query ที่ LLM ขยาย
+    q_raw = rerank_query or (query if isinstance(query, str) else "")
+    wanted = question_articles(q_raw)
     if RERANK_ENABLED and rerank_query:
         # ⚠️ ให้ reranker คืนทั้ง pool (ไม่ใช่แค่ k) แล้วค่อย demote/boost แล้วจึงตัด k
         #    ถ้าตัด k ก่อน มาตราที่ผู้ใช้ถามอาจไม่ติด k ตัวแรก → ไม่มีอะไรให้ boost
         n = max(RERANK_TOP_N, k)
         ranked = rerank(rerank_query, ranked[:n], n)
-    return _boost_exact_article(_demote_scans(ranked), wanted)[:k]
+    ranked = _demote_scans(ranked)
+    # ลำดับสำคัญ: ดันฉบับที่อ้างถึงก่อน แล้วค่อยดันมาตราที่ถาม (มาตราชนะเพราะเจาะกว่า)
+    ranked = _boost_amend(ranked, question_amendments(q_raw))
+    return _boost_exact_article(ranked, wanted)[:k]
 
 
 def status_label(c: dict) -> str:
@@ -1278,6 +1354,13 @@ SYSTEM_PROMPT = (
     "- ⚠️ ถ้าคำถามเป็นแบบ 'มีอะไรบ้าง/กี่ฉบับ/มาตราใดบ้าง' ให้ไล่ทุกรายการที่พบใน context\n"
     "  ให้ครบทุกตัว พร้อมเลขมาตราและปี ห้ามยกมาแค่ตัวอย่างแล้วสรุปรวบ\n"
     "  ถ้า context มีข้อมูลไม่ครบ ให้บอกว่าเจอเท่าไรและอาจมีมากกว่านี้\n"
+    "- ⚠️ ถ้าบทบัญญัติเดียวระบุหลายรายการ (หลายมาตรา หลายเงื่อนไข หลายอัตรา)\n"
+    "  ต้องยกมาให้ครบ ไม่ใช่ตอบแต่รายการแรกหรือรายการเด่น\n"
+    "- ⚠️ ระบุ 'ตัวระบุ' ให้ครบเสมอ — เลขมาตรา เลขหมวด ชื่อตำแหน่ง ชื่อเอกสาร คำนิยาม\n"
+    "  อย่าอธิบายแต่เนื้อหาโดยไม่บอกว่าเป็นมาตราหรือหมวดใด\n"
+    "- ⚠️ ห้ามสรุปว่าเอกสารสองฉบับ 'เกี่ยวข้องกัน' เพียงเพราะประกาศใกล้กัน เลขติดกัน\n"
+    "  หรืออยู่ในชุดเดียวกัน — ยืนยันความเกี่ยวข้องได้ต่อเมื่อตัวบทอ้างถึงกันจริง\n"
+    "  หรือแก้ไขมาตราเดียวกัน ถ้าไม่มีหลักฐานให้ตอบว่าเป็นคนละเรื่องกัน\n"
     "- หัวบล็อกบอกสถานะตัวบท ใช้ตัดสินว่าจะเชื่อบล็อกไหน — ห้ามคัดลอก '✅'/'⚠️' ลงในคำตอบ\n"
     "  · ถ้ามีทั้งบล็อก '✅ ใช้บังคับปัจจุบัน' และ '⚠️' ที่เนื้อหาขัดกัน ให้ตอบตามบล็อก ✅\n"
     "    แล้วบอกสั้น ๆ ว่าตัวบทเดิมต่างอย่างไร\n"

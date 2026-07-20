@@ -88,19 +88,25 @@ def pick_groups(question: str, all_groups: list[str]) -> tuple[list[str], list[i
     ถามประวัติแก้ไข -> + ประวัติการแก้ไข + ฉบับดั้งเดิม
     คืน (groups, years, versions)"""
     groups = [g for g in all_groups if g == rag.GROUP_IN_FORCE] or list(all_groups)
-    years = [y for y in rag.detect_years(question) if y != rag.PUBLISH_STAMP_YEAR]
     versions: list[int] = []
-    if years:
+    # ⚠️ ย้อนเวลาเฉพาะปีที่เป็น "คำขอย้อนเวลา" จริง ๆ เท่านั้น
+    #    ปีที่เป็นชื่อเอกสาร ("ฉบับที่ ๑๕ พ.ศ. ๒๕๖๒") หรือเงื่อนไขในตัวบท
+    #    ("ออกใบจองหลังวันที่ ... ๒๕๑๕") ห้ามเอามาล็อกเวอร์ชัน ไม่งั้นจะตอบด้วยกฎหมายเก่า
+    kinds = rag.classify_years(question)
+    asof = [y for y in kinds["asof"] if y != rag.PUBLISH_STAMP_YEAR]
+    if asof:
         # แปลงปี -> ฉบับที่ใช้บังคับ ณ ปีนั้น (ไม่ใช่ฉบับที่ตีพิมพ์ปีนั้นเป๊ะ ๆ)
-        # แล้วกรองด้วย version แทน year — กฎหมายไม่ได้แก้ทุกปี กรองด้วยปีตรง ๆ จะได้ศูนย์ผล
-        versions = [v for v in {rag.version_at_year(y) for y in years} if v >= 0]
+        # กรองด้วย version แทน year — กฎหมายไม่ได้แก้ทุกปี กรองด้วยปีตรง ๆ จะได้ศูนย์ผล
+        versions = [v for v in {rag.version_at_year(y) for y in asof} if v >= 0]
         if versions:
             groups = [g for g in all_groups if g == rag.GROUP_HISTORY] or groups
         groups += [g for g in all_groups if g == rag.GROUP_AMEND]
-        years = []                              # กรองด้วย version แม่นกว่า ไม่ต้องกรองปีซ้ำ
+    # อ้างถึง "ฉบับที่ N" = คำตอบน่าจะอยู่ในตัว พ.ร.บ. แก้ไขฉบับนั้น (ดันอันดับใน retrieve)
+    if rag.question_amendments(question):
+        groups += [g for g in all_groups if g == rag.GROUP_AMEND]
     if _HISTORY_HINT.search(question or ""):    # ถามเรื่องการแก้ไข -> ปลดประวัติ
         groups += [g for g in all_groups if g in (rag.GROUP_AMEND, rag.GROUP_ORIGINAL)]
-    return list(dict.fromkeys(groups)), years, versions
+    return list(dict.fromkeys(groups)), [], versions
 
 
 # ── ข้อมูลดัชนี (อ่านหลัง rag โหลด index แล้ว) ────────────────────────────────
