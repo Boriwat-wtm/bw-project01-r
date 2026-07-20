@@ -1,0 +1,286 @@
+"""
+service.py — เครื่องยนต์ RAG ระดับแอปพลิเคชัน (ไม่ผูกกับ UI ใดๆ)
+
+รวม logic ที่เคยปนอยู่ใน app.py (Streamlit) ออกมาให้เป็นกลาง:
+  - group routing, multi-turn query rewriting, prompt building
+  - answer_stream(): pipeline ทั้งเส้นเป็น "generator" ที่ yield เหตุการณ์ออกมา
+    → คนเรียก (Streamlit / FastAPI / CLI) ตัดสินใจเองว่าจะเอาเหตุการณ์ไปทำอะไร
+
+เหตุการณ์ที่ answer_stream yield:
+  {"stage": str}                                  ขั้นตอนปัจจุบัน (ให้ UI โชว์ progress)
+  {"meta":  {"groups", "search_q", "n_sources"}}  ข้อมูลหลังค้นเสร็จ
+  {"token": str}                                  token คำตอบ (streaming)
+  {"reasoning": str}                              token ส่วน reasoning (โมเดลคิด)
+  {"final": {"answer","chunks","reasoning","groups_used","elapsed","search_q"}}
+"""
+import json
+import re
+import time
+import urllib.request
+from typing import Iterator, Optional
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+import rag
+
+# ── config ────────────────────────────────────────────────────────────────────
+HISTORY_TURNS = 3          # จำนวนคู่ถาม-ตอบล่าสุดที่ส่งเข้าโมเดล (มากไป = เปลือง+ไขว้เขว)
+HISTORY_ANSWER_MAX = 700   # ตัดคำตอบเก่าให้สั้น กัน token บาน
+
+# คำอธิบายกลุ่มเอกสาร — ใช้ให้ LLM router เลือกกลุ่มที่ถูกต้อง
+# กลุ่มมาจาก rag.parse_doc_name() (แกะจากชื่อไฟล์) ไม่ใช่ชื่อโฟลเดอร์
+# กลุ่มไหนไม่มีในนี้ router จะใช้ชื่อกลุ่มแทน (ยังทำงานได้ แต่เลือกแม่นน้อยลง)
+GROUP_DESC = {
+    rag.GROUP_IN_FORCE: (
+        "ประมวลกฎหมายที่ดิน ฉบับที่ใช้บังคับอยู่ปัจจุบัน (รวมการแก้ไขทุกฉบับแล้ว) — "
+        "ตอบคำถามทั่วไปว่า 'กฎหมายว่าอย่างไร' เช่น สิทธิในที่ดิน โฉนด น.ส.๓ "
+        "การออกหนังสือแสดงสิทธิ ค่าธรรมเนียม คนต่างด้าว บทกำหนดโทษ"
+    ),
+    rag.GROUP_AMEND: (
+        "พ.ร.บ.แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ ๑–๑๕) แต่ละฉบับแยกกัน — "
+        "ใช้เมื่อถามว่ามาตราไหนถูกแก้เมื่อไร ฉบับที่เท่าไร ปี พ.ศ. ใด หรือถามเหตุผลการแก้ไข"
+    ),
+    rag.GROUP_HISTORY: (
+        "ประมวลกฎหมายที่ดินฉบับรวม ณ ช่วงเวลาต่าง ๆ ในอดีต — "
+        "ใช้เฉพาะเมื่อถามว่า 'ตอนปี พ.ศ. ... กฎหมายว่าอย่างไร'"
+    ),
+    rag.GROUP_ORIGINAL: (
+        "ประมวลกฎหมายที่ดิน พ.ศ. ๒๔๙๗ ฉบับดั้งเดิมตอนประกาศใช้ครั้งแรก — "
+        "ใช้เมื่อถามตัวบทดั้งเดิมโดยตรง หรือขอเทียบกับของปัจจุบัน"
+    ),
+}
+
+# คำที่บ่งว่าผู้ใช้ถาม "ประวัติการแก้ไข" ไม่ใช่ "ตัวบทปัจจุบัน"
+_HISTORY_HINT = re.compile(
+    r"แก้ไข|แก้เมื่อ|ฉบับที่|เดิม|ดั้งเดิม|ก่อนหน้า|เคยเป็น|ย้อนหลัง|ประวัติ|"
+    r"เปลี่ยนแปลง|ต่างจาก|เทียบ|ยกเลิก|เพิ่มเติม"
+)
+
+
+def pick_groups(question: str, all_groups: list[str]) -> tuple[list[str], list[int], list[int]]:
+    """ตัดสิน 'ควรค้นกลุ่มไหน' ด้วยกฎในโค้ด ไม่ใช่ให้ LLM เดา
+    เหตุผล: 'กฎหมายฉบับไหนใช้บังคับอยู่' เป็นข้อเท็จจริง ไม่ใช่เรื่องตีความ
+    ถ้าปล่อยให้ router พลาด = ตอบด้วยตัวบทที่ถูกยกเลิกไปแล้ว ซึ่งรับไม่ได้
+
+    default        -> ฉบับใช้บังคับปัจจุบันเท่านั้น
+    ระบุ พ.ศ.      -> ฉบับย้อนหลังที่ใช้บังคับ ณ ปีนั้น (+ ประวัติการแก้ไข)
+    ถามประวัติแก้ไข -> + ประวัติการแก้ไข + ฉบับดั้งเดิม
+    คืน (groups, years, versions)"""
+    groups = [g for g in all_groups if g == rag.GROUP_IN_FORCE] or list(all_groups)
+    years = [y for y in rag.detect_years(question) if y != rag.PUBLISH_STAMP_YEAR]
+    versions: list[int] = []
+    if years:
+        # แปลงปี -> ฉบับที่ใช้บังคับ ณ ปีนั้น (ไม่ใช่ฉบับที่ตีพิมพ์ปีนั้นเป๊ะ ๆ)
+        # แล้วกรองด้วย version แทน year — กฎหมายไม่ได้แก้ทุกปี กรองด้วยปีตรง ๆ จะได้ศูนย์ผล
+        versions = [v for v in {rag.version_at_year(y) for y in years} if v >= 0]
+        if versions:
+            groups = [g for g in all_groups if g == rag.GROUP_HISTORY] or groups
+        groups += [g for g in all_groups if g == rag.GROUP_AMEND]
+        years = []                              # กรองด้วย version แม่นกว่า ไม่ต้องกรองปีซ้ำ
+    if _HISTORY_HINT.search(question or ""):    # ถามเรื่องการแก้ไข -> ปลดประวัติ
+        groups += [g for g in all_groups if g in (rag.GROUP_AMEND, rag.GROUP_ORIGINAL)]
+    return list(dict.fromkeys(groups)), years, versions
+
+
+# ── ข้อมูลดัชนี (อ่านหลัง rag โหลด index แล้ว) ────────────────────────────────
+def list_groups() -> list[str]:
+    """รายชื่อกลุ่มเอกสารทั้งหมดในดัชนี"""
+    return sorted({c.get("group", "") for c in rag._chunks if c.get("group")})
+
+
+def list_years() -> list[int]:
+    """ปีเอกสารทั้งหมดในดัชนี (>0 เท่านั้น; 0 = ไม่ระบุปี)"""
+    return sorted({int(c.get("year", 0) or 0) for c in rag._chunks if c.get("year")})
+
+
+def list_models() -> list[str]:
+    """ดึงรายชื่อ model จาก endpoint (/v1/models) — กรอง embedding ออก"""
+    try:
+        req = urllib.request.Request(
+            f"{rag.LLM_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {rag.LLM_API_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        ids = sorted(m["id"] for m in data.get("data", [])
+                     if m.get("id") and "embed" not in m["id"].lower())
+        if ids:
+            return ids
+    except Exception:
+        pass
+    return [rag.LLM_MODEL]
+
+
+# ── group auto-routing ────────────────────────────────────────────────────────
+def route_groups(llm, question: str, groups: list[str]) -> list[str]:
+    """ให้ LLM เลือกว่าคำถามควรค้นในกลุ่มเอกสารไหน (ตอบเป็นเลข → map กลับเป็นชื่อกลุ่ม)
+    fallback: ทุกกลุ่ม ถ้า LLM ตอบเพี้ยน/พัง"""
+    lines = "\n".join(f"{i+1}. {g} — {GROUP_DESC.get(g, g)}" for i, g in enumerate(groups))
+    sys_prompt = (
+        "You are a routing classifier for a Thai law document search system. Given a user "
+        "question (Thai or English), decide which SINGLE document group best answers it.\n\n"
+        f"Groups:\n{lines}\n\n"
+        "Default to the group holding the CURRENT consolidated law — most questions ask what "
+        "the law says today, not its history.\n"
+        'Reply with ONLY ONE number — the single most relevant group (e.g. "1"). '
+        "Return TWO numbers only if the question clearly needs both the current text AND its "
+        "amendment history. Strongly prefer exactly ONE. No words, no explanation."
+    )
+    try:
+        r = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=question)])
+        rag.track_usage(r)
+        nums = re.findall(r"\d+", str(r.content))
+        picked = [groups[int(n) - 1] for n in nums if 1 <= int(n) <= len(groups)]
+        picked = list(dict.fromkeys(picked))     # de-dup คงลำดับ
+        if picked:
+            return picked
+    except Exception:
+        pass
+    return list(groups)
+
+
+# ── multi-turn (ถามต่อเนื่องได้) ──────────────────────────────────────────────
+def recent_turns(history: list, n: int = HISTORY_TURNS) -> list:
+    """คู่ถาม-ตอบล่าสุด n คู่ (ตัดคำตอบยาวๆ ให้สั้นลง)"""
+    out = []
+    for m in history:
+        role = m.get("role")
+        content = str(m.get("content", "")).strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        if role == "assistant" and len(content) > HISTORY_ANSWER_MAX:
+            content = content[:HISTORY_ANSWER_MAX] + " …"
+        out.append({"role": role, "content": content})
+    return out[-(n * 2):]
+
+
+def rewrite_followup(llm, question: str, history: list) -> str:
+    """แปลงคำถามต่อเนื่องให้ "สมบูรณ์ในตัว" ก่อนเอาไปค้น/เลือกกลุ่ม
+    เช่น "แล้วโทษล่ะ" + ประวัติ → "โทษของการบุกรุกที่ดินของรัฐตามมาตรา ๙ คืออะไร"
+    ไม่มีประวัติ หรือคำถามสมบูรณ์อยู่แล้ว → คืนคำถามเดิม"""
+    turns = recent_turns(history, 2)
+    if not turns:
+        return question
+    convo = "\n".join(("ผู้ใช้: " if t["role"] == "user" else "ผู้ช่วย: ") + t["content"]
+                      for t in turns)
+    sys_prompt = (
+        "Rewrite the user's latest question into a STANDALONE question that can be "
+        "understood without the conversation — resolve pronouns and implied subjects "
+        "from the history (e.g. 'แล้วโทษล่ะ' -> 'โทษของการเข้าไปยึดถือครอบครองที่ดินของรัฐคืออะไร').\n"
+        "- Keep any มาตรา/ข้อ number mentioned earlier if the new question refers to it.\n"
+        "Rules:\n"
+        "- If the question is ALREADY standalone, return it UNCHANGED.\n"
+        "- Keep the user's original language.\n"
+        "- Reply with ONLY the question. No quotes, no explanation."
+    )
+    try:
+        r = llm.invoke([
+            SystemMessage(content=sys_prompt),
+            HumanMessage(content=f"บทสนทนาก่อนหน้า:\n{convo}\n\nคำถามล่าสุด: {question}"),
+        ])
+        rag.track_usage(r)
+        out = " ".join(str(r.content).split()).strip().strip('"')
+        # กันโมเดลเพี้ยน (ตอบยาวเป็นย่อหน้า/ตอบว่าง) → ใช้ของเดิมปลอดภัยกว่า
+        if out and len(out) <= max(240, len(question) * 4):
+            return out
+    except Exception:
+        pass
+    return question
+
+
+def build_user_prompt(question: str, context: str, domain: str = "thai_law") -> str:
+    prof = rag.DOMAINS.get(domain, rag.DOMAINS["thai_law"])
+    cite = "เลขมาตรา/ข้อ/หน้า" if domain == "thai_law" else "เลข Article/หน้า"
+    return (
+        f"{prof['user_intro']}\n\n{context}\n\n"
+        f"================\n"
+        f"คำถาม: {question}\n\n"
+        f"ตอบโดยอ้างอิงเฉพาะเอกสารด้านบน พร้อมระบุ{cite}"
+    )
+
+
+# ── core pipeline (generator — ไม่ผูก UI) ─────────────────────────────────────
+def answer_stream(llm, question: str, *, auto_group: bool = True,
+                  all_groups: Optional[list[str]] = None,
+                  manual_groups: Optional[list[str]] = None,
+                  year_filter: Optional[list[int]] = None,
+                  history: Optional[list] = None,
+                  stream: bool = True) -> Iterator[dict]:
+    """RAG pipeline: routing → multi-turn rewrite → hybrid retrieve+rerank → LLM ตอบ
+    yield เหตุการณ์ทีละขั้น (ดู docstring หัวไฟล์) — คนเรียกเอาไปแสดง/ส่ง SSE เอง"""
+    t0 = time.perf_counter()
+    history = history or []
+    all_groups = all_groups or []
+
+    # 0) คำถามต่อเนื่อง → เขียนใหม่ให้สมบูรณ์ก่อน (ใช้ค้น+เลือกกลุ่ม; ตอนตอบใช้คำถามเดิม+ประวัติ)
+    search_q = question
+    if history:
+        yield {"stage": "เข้าใจคำถามต่อเนื่อง"}
+        search_q = rewrite_followup(llm, question, history)
+
+    # 1) เลือกกลุ่มเอกสาร — ใช้กฎในโค้ด ไม่ใช่ LLM (ดูเหตุผลใน pick_groups)
+    #    เลือกเองจาก UI (manual) ชนะเสมอ — ผู้ใช้รู้ว่าตัวเองต้องการอะไร
+    if not auto_group and manual_groups:
+        groups_used, auto_years, versions = manual_groups, [], []
+    else:
+        yield {"stage": "เลือกกลุ่มเอกสาร"}
+        groups_used, auto_years, versions = pick_groups(search_q, all_groups)
+    year_filter = year_filter or auto_years or None
+    filter_groups = groups_used or None
+    # โดเมน → เลือก prompt/expand/intro (โปรเจกต์นี้มีโปรไฟล์เดียว: thai_law)
+    domain = rag.domain_of_group(groups_used[0]) if groups_used else "thai_law"
+
+    # 2) ขยายคำถาม (multi-query) + 3) retrieve (hybrid RRF + filter + rerank)
+    yield {"stage": "ค้นเอกสาร"}
+    search_qs = rag.expand_queries(llm, search_q, domain=domain)
+    chunks = rag.retrieve(search_qs, rerank_query=search_q, groups=filter_groups,
+                          years=year_filter, versions=versions or None)
+    context = rag.format_context(chunks)
+    yield {"meta": {"groups": groups_used, "n_sources": len(chunks),
+                    "search_q": search_q if search_q != question else ""}}
+
+    # 4) ประกอบข้อความ: system (ตามโดเมน) + ประวัติล่าสุด + (เอกสาร + คำถามปัจจุบัน)
+    sys_prompt = rag.DOMAINS.get(domain, rag.DOMAINS["thai_law"])["system_prompt"]
+    messages: list = [SystemMessage(content=sys_prompt)]
+    for t in recent_turns(history):
+        messages.append(HumanMessage(content=t["content"]) if t["role"] == "user"
+                        else AIMessage(content=t["content"]))
+    messages.append(HumanMessage(content=build_user_prompt(question, context, domain)))
+
+    # 5) ตอบ (stream = yield ทีละ token)
+    yield {"stage": "เขียนคำตอบ"}
+    answer, reasoning = "", ""
+    if stream:
+        full = None
+        try:
+            gen = llm.stream(messages, stream_usage=True)
+        except TypeError:
+            gen = llm.stream(messages)
+        for chunk in gen:
+            full = chunk if full is None else full + chunk
+            ak = getattr(chunk, "additional_kwargs", {}) or {}
+            rc = ak.get("reasoning_content") or ak.get("reasoning") or ""
+            c = str(getattr(chunk, "content", "") or "")
+            if rc and not answer:
+                reasoning += str(rc)
+                yield {"reasoning": str(rc)}
+            if c:
+                answer += c
+                yield {"token": c}
+        if not answer and reasoning:      # thinking model ที่ส่งมาแต่ reasoning
+            answer = reasoning
+        if full is not None:
+            rag.track_usage(full)
+    else:
+        resp = rag.invoke_retry(
+            llm, messages,
+            ok_fn=lambda c: not rag.looks_truncated(c), label="answer",
+        )
+        answer = str(resp.content)
+        ak = getattr(resp, "additional_kwargs", {}) or {}
+        reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+        yield {"token": answer}
+
+    yield {"final": {"answer": answer, "chunks": chunks, "reasoning": reasoning,
+                     "groups_used": groups_used, "elapsed": time.perf_counter() - t0,
+                     "search_q": search_q if search_q != question else ""}}

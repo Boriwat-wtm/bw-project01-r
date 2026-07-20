@@ -1,0 +1,34 @@
+# Streamlit config สำหรับ Thai Law RAG Chatbot
+
+[server]
+# ปิด file-watcher — กัน traceback 'No module named torchvision' ที่เกิดจาก
+# Streamlit สแกนโมดูล transformers (dependency ของ rerank) ทุกครั้งที่ rerun
+# traceback นี้ไม่กระทบการทำงาน แค่ทำให้ log รก
+# ⚠️ ผลข้างเคียง: แก้โค้ด app.py แล้วต้อง restart เอง (ไม่ auto-reload)
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+# ── ธีม ──────────────────────────────────────────────────────────────────────
+# กำหนดทั้งสองโหมดไว้ที่นี่ → Streamlit จัดสี "widget ของตัวเอง" (dropdown ที่กางออก,
+# tooltip, เมนู, popover) ให้ถูกทั้งสองธีม ซึ่ง CSS ฝั่งเราเอื้อมไปแก้ไม่ได้
+# ผู้ใช้สลับได้ที่เมนู ☰ (มุมขวาบน) → Settings → Appearance (มี System ตามเครื่องด้วย)
+# ⚠️ ค่าสีต้องตรงกับ _PALETTE ใน app.py — app อ่านธีมปัจจุบันผ่าน st.context.theme.type
+#    แล้วสร้าง CSS ของคลาสเราเองให้สีตรงกัน
+[theme]
+font = "sans serif"
+
+[theme.light]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F8FA"
+textColor = "#15181E"
+borderColor = "#E3E6EB"
+primaryColor = "#D40500"              # accent — ใช้บอก active state เท่านั้น
+
+[theme.dark]
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#141821"
+textColor = "#E6E8EC"
+borderColor = "#252A34"
+primaryColor = "#E10600"

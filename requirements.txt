@@ -1,0 +1,31 @@
+# UI (chatbot)
+streamlit             # หน้าเว็บแชท — รัน: streamlit run app.py
+
+# API (ให้ภายนอกเรียก) — รัน: uvicorn main:app --port 8000
+fastapi
+uvicorn[standard]     # ASGI server
+
+# OCR (local — สำหรับ PDF สแกน/รูปภาพ เช่น ราชกิจจานุเบกษา)
+easyocr               # OCR ภาษาไทย รันในเครื่อง (ใช้ GPU ถ้ามี) ไม่ต่อเน็ต
+pymupdf               # render หน้า PDF -> รูป ก่อนส่งเข้า OCR
+
+# RAG core
+python-dotenv         # โหลด endpoint/API key จาก .env (ไม่ hardcode ในโค้ด)
+chromadb              # vector store (semantic) + เก็บ metadata/กรอง group ในตัว
+langchain-openai      # chat LLM ผ่าน OpenAI-compatible endpoint
+langchain-ollama      # embeddings (paraphrase-multilingual)
+langchain-core
+rank_bm25
+pdfplumber
+
+# eval / ground truth (FIFA dataset scripts)
+pandas
+
+# experiment tracking (log ผลขึ้น MLflow server)
+mlflow
+openpyxl              # export ตารางผลเป็น .xlsx (artifact)
+
+# cross-encoder reranker (RAG_RERANK=1 หรือ --rerank) — RRF top-N → rerank → top-K
+# ⚠️ torch ต้องเป็นเวอร์ชัน CUDA ถ้ามี GPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+sentence-transformers  # โมเดล default: BAAI/bge-reranker-v2-m3 (multilingual)

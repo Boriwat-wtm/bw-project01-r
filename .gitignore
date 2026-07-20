@@ -1,0 +1,56 @@
+# Large data files
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets (ค่าจริง endpoint+key อยู่ใน .env — commit เฉพาะ .env.example)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+venv/
+.venv/
+
+# เครื่องมือ/ผู้ช่วย ไม่ใช่ส่วนของโปรเจกต์ (skill ส่วนตัว + repo ที่ clone มา)
+.claude/
+gridgeist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# RAG index (ใหญ่/generated — rebuild ด้วย: python -c "import rag; rag.build_vectorstore(force=True)")
+file_hashes.json
+
+# ประวัติแชท + feedback ของ UI (local/ส่วนตัว — generated)
+chat_history.json
+
+# Databases (เก่า/generated)
+*.db
+chroma_db/
+zvec_test/zvec_db/
+*.rocksdb/
+
+# MLflow local (โปรเจกต์นี้ใช้ remote server)
+mlruns/
+
+# ตัวนับเลขรอบ experiment (state เฉพาะเครื่อง)
+.round_counter.json
+
+# ผลการทดลองที่ generated (ใหญ่มาก + มี artifact ใน MLflow แล้ว) — เก็บเฉพาะ ground_truth (dataset)
+eval/**/*.json
+!eval/ground_truth.json
+eval/**/*.xlsx
+
+# โมเดล/แคชที่โหลดมา
+*.gguf
+
+# เอกสารต้นทาง PDF (25MB — เก็บนอก repo; เอามาวางใน data/ เองตอนใช้งาน)
+data/
+
+# OCR cache (generated — local)
+ocr_cache/
