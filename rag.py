@@ -681,6 +681,7 @@ def _chroma_metadata(c: dict) -> dict:
         # ── ฟิลด์ที่ใช้กรอง/จัดอันดับตอน retrieve ──
         "in_force": bool(c.get("in_force", False)),      # ใช้บังคับอยู่จริงไหม
         "as_of_year": int(c.get("as_of_year", 0) or 0),  # ตัวบท ณ ปีไหน
+        "amend_no": int(c.get("amend_no", 0) or 0),      # รวมถึงฉบับแก้ไขที่เท่าไร
         "doc_label": c.get("doc_label", "") or "",       # ชื่อเอกสารอ่านง่าย
         "articles": c.get("articles", "") or "",         # '|มาตรา ๙|มาตรา ๙/๑|'
         "article_nums": c.get("article_nums", "") or "", # '|9|9/1|'
@@ -688,6 +689,24 @@ def _chroma_metadata(c: dict) -> dict:
         "section": c.get("section", "") or "",           # หมวด/ภาค
         "n_articles": int(c.get("n_articles", 0) or 0),
     }
+
+
+def refresh_metadata(batch: int = 500) -> int:
+    """อัปเดต metadata ใน Chroma ให้ตรงกับที่โค้ดปัจจุบันคำนวณได้ โดยไม่ embed ใหม่
+
+    ใช้เมื่อเปลี่ยน "วิธีคำนวณ metadata" แต่ไม่ได้เปลี่ยนตัวข้อความ (เช่น ปรับสูตร
+    as_of_year หรือเพิ่มฟิลด์ใหม่) — embedding เดิมยังถูกต้องอยู่ ไม่มีเหตุต้องคำนวณซ้ำ
+    ⚠️ ถ้า "ข้อความ" เปลี่ยน (chunk size, ตัวคัดข้อความ) ต้องใช้ build_vectorstore(force=True)
+    คืนจำนวน chunk ที่อัปเดต"""
+    _init_chroma()
+    _ensure_loaded()
+    assert _collection is not None
+    ids = [c["id"] for c in _chunks]
+    metas = [_chroma_metadata(c) for c in _chunks]
+    for i in range(0, len(ids), batch):
+        _collection.update(ids=ids[i:i + batch], metadatas=metas[i:i + batch])
+        print(f"  metadata {min(i + batch, len(ids))}/{len(ids)}")
+    return len(ids)
 
 
 def build_vectorstore(force: bool = False):
