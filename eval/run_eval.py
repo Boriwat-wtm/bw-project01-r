@@ -107,6 +107,7 @@ def log_mlflow(results: list, mode: str, out_path: str, run_idx: int, tag: str) 
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
         mlflow.set_tracking_uri(uri)
+    # แยก experiment ของโปรเจกต์นี้ไว้ต่างหาก — เปลี่ยนได้ด้วย env MLFLOW_EXPERIMENT
     mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "thai-law-rag-eval"))
 
     n = len(results)
