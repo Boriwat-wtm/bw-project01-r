@@ -62,7 +62,9 @@ _COMPARE_HINT = re.compile(
     r"ถูกแก้|เคยแก้|แก้ไขกี่|กี่ครั้ง|แก้เมื่อไร|แก้ไขเมื่อไร|ประวัติการแก้|"
     r"เปลี่ยนไปอย่างไร|เปลี่ยนแปลงอย่างไร|"
     # คำถามแนวไล่สาย (chain) — "ก่อนหน้าของก่อนหน้า", "ฉบับใดบ้าง", "ที่มาอย่างไร"
-    r"ก่อนหน้า|กี่ฉบับ|ฉบับใดบ้าง|ฉบับไหนบ้าง|ลำดับเวลา|ที่มาอย่างไร|มีที่มา|ยังมีอยู่"
+    r"ก่อนหน้า|กี่ฉบับ|ฉบับใดบ้าง|ฉบับไหนบ้าง|ลำดับเวลา|ที่มาอย่างไร|มีที่มา|ยังมีอยู่|"
+    # ถามว่าส่วนต่าง ๆ ของมาตราเดียวกันมาจากฉบับใด (provenance ระดับวรรค)
+    r"คนละฉบับ|มาจากกฎหมาย|มาจากฉบับ|แก้ไขโดยฉบับใด"
 )
 
 
@@ -350,7 +352,22 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     search_qs = rag.expand_queries(llm, search_q, domain=domain)
     chunks = rag.retrieve(search_qs, rerank_query=search_q, groups=filter_groups,
                           years=year_filter, versions=versions or None)
+    # ── เติม "ข้อมูลที่คำนวณจากเอกสารด้วยโค้ด" ไว้หัว context ────────────────
+    # ไม่ใช่การสั่ง LLM ผ่าน prompt (ซึ่งกระทบทุกคำถามและโมเดลอาจไม่ทำตาม)
+    # แต่เป็นการรับประกันว่าข้อเท็จจริงชี้ขาดอยู่ใน context แน่นอน — และตรวจย้อนได้ว่ามาจากไหน
+    # ยิงเฉพาะเมื่อเข้าเงื่อนไข คำถามอื่นจึงไม่เห็นความเปลี่ยนแปลงใด ๆ
+    facts = []
+    for no in rag.question_amendments(search_q):       # ถามถึง "ฉบับที่ N"
+        brief = rag.amendment_brief(no)
+        if brief:
+            facts.append(brief)
+    if rag._ROLE_CUE.search(search_q):                 # ถามถึงองค์ประกอบคณะกรรมการ
+        roles = rag.format_roles(chunks)
+        if roles:
+            facts.append(roles)
     context = rag.format_context(chunks)
+    if facts:
+        context = "\n\n".join(facts) + "\n\n" + "=" * 16 + "\n\n" + context
     yield {"meta": {"groups": groups_used, "n_sources": len(chunks),
                     "search_q": search_q if search_q != question else ""}}
 

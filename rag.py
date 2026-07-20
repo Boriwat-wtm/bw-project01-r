@@ -542,17 +542,22 @@ def classify_years(question: str) -> dict:
     return out
 
 
-_AMEND_REF_RE = re.compile(r"ฉบับที่\s*([๐-๙\d]+)")
+# ⚠️ ต้องรับการไล่เลขด้วย — "ฉบับที่ ๑๓, ๑๔ และ ๑๕" มีคำว่า 'ฉบับที่' แค่ตัวแรก
+#    ถ้าจับแต่ตัวแรกจะได้ข้อมูลฉบับเดียวแล้วตอบว่า "ไม่พบข้อมูลของฉบับที่ ๑๕"
+_AMEND_REF_RE = re.compile(
+    r"ฉบับที่\s*([๐-๙\d]+(?:\s*(?:,|และ|หรือ|ถึง|-)\s*(?:ฉบับที่\s*)?[๐-๙\d]+)*)")
+_NUM_SPLIT_RE = re.compile(r"[๐-๙\d]+")
 
 
 def question_amendments(question: str) -> list[int]:
-    """เลข 'ฉบับที่ N' ที่ผู้ใช้อ้างถึงในคำถาม -> [12]
+    """เลข 'ฉบับที่ N' ที่ผู้ใช้อ้างถึงในคำถาม -> [13, 14, 15]
     เป็นสัญญาณที่ชัดที่สุดว่าคำตอบอยู่ในเอกสารฉบับแก้ไขไหน — 12 จาก 30 คำถามมีสัญญาณนี้"""
-    out = []
+    out: list[int] = []
     for m in _AMEND_REF_RE.finditer(question or ""):
-        n = int(m.group(1).translate(THAI_DIGITS))
-        if 1 <= n <= 50 and n not in out:      # เลขใหญ่ ๆ = อ้างกฎหมายอื่น (ปว.๓๓๔)
-            out.append(n)
+        for tok in _NUM_SPLIT_RE.findall(m.group(1)):
+            n = int(tok.translate(THAI_DIGITS))
+            if 1 <= n <= 50 and n not in out:   # เลขใหญ่ ๆ = อ้างกฎหมายอื่น (ปว.๓๓๔)
+                out.append(n)
     return out
 
 
@@ -1145,9 +1150,13 @@ def doc_articles(path: str) -> dict[str, str]:
 #   "ให้ยกเลิกความในมาตรา ๖๑ ... ซึ่งแก้ไขเพิ่มเติมโดย <ฉบับก่อนหน้า> และให้ใช้ความต่อไปนี้แทน"
 # ดึงด้วย regex ได้แม่นเกือบ 100% และฟรี — ดีกว่าให้ LLM ไล่เอง ซึ่งทั้งช้าและเดาผิดได้
 # พอมีกราฟแล้ว multi-hop = เดินกราฟ ไม่ต้องยิง LLM ซ้ำหลายรอบ
+# เก็บส่วน "วรรคหนึ่งและวรรคสองของ" ไว้ด้วย (กลุ่มที่ 1) — มาตราเดียวอาจถูกแก้คนละวรรค
+# คนละฉบับ เช่น ม.๘๑ วรรค ๑-๒ มาจาก ฉ.๑๓ ส่วนวรรค ๓ ยังเป็นของ ฉ.๙ ถ้าไม่เก็บระดับวรรค
+# จะตอบได้แค่ "มาตรานี้ถูกแก้โดย ฉ.๑๓" ซึ่งไม่ตรงความจริงทั้งมาตรา
 _CLAUSE_RE = re.compile(
     r"(?:ให้ยกเลิกความใน|ยกเลิกความใน|ให้ยกเลิก|เพิ่มความต่อไปนี้เป็น)\s*"
-    rf"(?:วรรค\S+\s*(?:และวรรค\S+\s*)?ของ\s*)?มาตรา\s*([๐-๙]+(?:/[๐-๙]+)?)\s*({_ART_ORD})?"
+    r"((?:วรรค\S+\s*(?:และวรรค\S+\s*)?ของ\s*)?)"
+    rf"มาตรา\s*([๐-๙]+(?:/[๐-๙]+)?)\s*({_ART_ORD})?"
     r"([^“]{0,200})")
 # <ฉบับก่อนหน้า> มี 3 รูปแบบ — ต้องรับให้ครบ ไม่งั้นสายขาดกลาง
 _PREV_PB_NO = re.compile(r"แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน\s*\(ฉบับที่\s*([๐-๙]+)\)\s*พ\.ศ\.\s*([๐-๙]+)")
@@ -1205,9 +1214,11 @@ def amendment_graph() -> dict:
         finally:
             doc.close()
         for m in _CLAUSE_RE.finditer(text):
-            art = _art_num(m.group(1), m.group(2) or "")
-            prev = _parse_prev(m.group(3))
-            entry = {"by": f"ฉบับที่ {no}", "amend_no": no, "year": year, "over": prev}
+            para = " ".join(m.group(1).replace("ของ", "").split())   # 'วรรคหนึ่งและวรรคสอง'
+            art = _art_num(m.group(2), m.group(3) or "")
+            prev = _parse_prev(m.group(4))
+            entry = {"by": f"ฉบับที่ {no}", "amend_no": no, "year": year,
+                     "over": prev, "para": para}
             lst = g.setdefault(art, [])
             if not any(e["amend_no"] == no for e in lst):
                 lst.append(entry)
@@ -1232,7 +1243,10 @@ def article_chain(num: str) -> list[dict]:
         out.append({"label": "ตัวบทเดิม ประมวลกฎหมายที่ดิน พ.ศ. ๒๔๙๗",
                     "year": 2497, "in_corpus": True})
     for e in lst:
-        out.append({"label": f"พ.ร.บ.แก้ไขเพิ่มเติมฯ (ฉบับที่ {e['amend_no']}) พ.ศ. {e['year']}",
+        # ระบุวรรคด้วยถ้ามี — มาตราเดียวอาจถูกแก้คนละวรรคโดยคนละฉบับ
+        scope = f" (เฉพาะ{e['para']})" if e.get("para") else ""
+        out.append({"label": f"พ.ร.บ.แก้ไขเพิ่มเติมฯ (ฉบับที่ {e['amend_no']}) "
+                             f"พ.ศ. {e['year']}{scope}",
                     "year": e["year"], "in_corpus": True})
     return out
 
@@ -1246,6 +1260,78 @@ def articles_amended_by(amend_no: int) -> list[dict]:
             if e["amend_no"] == amend_no:
                 out.append({"article": art, "over": e["over"]})
     return sorted(out, key=lambda x: (len(x["article"]), x["article"]))
+
+
+# พ.ร.บ.แก้ไขทุกฉบับมี "มาตรา ๒ = บทบังคับใช้" เสมอ และมักเขียนตัวเลขเป็นตัวหนังสือ
+# ("เมื่อพ้นกำหนดหนึ่งร้อยแปดสิบวัน") ดึงเก็บไว้ตรง ๆ ดีกว่าหวังให้ retrieval คว้ามาได้ครบ
+# ตอนผู้ใช้ขอเทียบวันมีผลบังคับหลายฉบับพร้อมกัน
+_EFFECTIVE_RE = re.compile(
+    r"มาตรา\s*๒\s*(พระราชบัญญัตินี้ให้ใช้บังคับ[^“”]{0,180}?(?:ราชกิจจานุเบกษา|เป็นต้นไป))")
+
+
+def amendment_brief(no: int) -> str:
+    """สรุป 'ฉบับที่ N ทำอะไรบ้าง' จากตัวเอกสารเอง — วันมีผลบังคับ + มาตราที่แก้ + แก้ทับใคร
+
+    คำนวณจากเอกสารด้วยโค้ด ไม่ใช่ให้ LLM ไล่อ่านเอง จึงครบและตรวจย้อนได้เสมอ
+    ตอบคำถามแนว 'ฉบับที่ ๔ แก้มาตราใดบ้าง / แก้ทับงานของใคร / มีผลบังคับเมื่อใด'"""
+    _ensure_loaded()
+    doc = next((c for c in _chunks if c.get("kind") == "amend"
+                and int(c.get("version", -1)) == no and not c.get("is_scan")), None)
+    if not doc:
+        return ""
+    import fitz
+    d = fitz.open(os.path.join(DATA_DIR, doc["source"]))
+    try:
+        text = " ".join("".join(d[i].get_text() for i in range(d.page_count)).split())
+    finally:
+        d.close()
+    lines = [f"สรุป พ.ร.บ.แก้ไขเพิ่มเติมประมวลกฎหมายที่ดิน (ฉบับที่ {no}) "
+             f"พ.ศ. {doc.get('year') or '?'}"]
+    m = _EFFECTIVE_RE.search(text)
+    if m:
+        lines.append(f"  วันมีผลบังคับ: {' '.join(m.group(1).split())}")
+    hits = articles_amended_by(no)
+    if hits:
+        lines.append(f"  แก้ไข/เพิ่ม {len(hits)} มาตรา (แต่ละมาตราแก้ทับงานของ):")
+        for h in hits:
+            over = h["over"]["label"] if h["over"] else "ตัวบทเดิม พ.ศ. ๒๔๙๗"
+            lines.append(f"    - มาตรา {h['article']}  <-  {over}")
+    return "\n".join(lines)
+
+
+# ตัวบทตั้งคณะกรรมการเขียนแบบตายตัว: "<ชื่อตำแหน่ง> เป็น <บทบาท>"
+# ปัญหาคือมันไล่รายชื่อกรรมการยาว ๑๐-๒๐ ตำแหน่งแล้ววาง "กรรมการและเลขานุการ" ไว้ท้ายสุด
+# LLM สรุปแล้วตัดท้ายทิ้งเป็นประจำ → ดึงบทบาทเฉพาะออกมาวางไว้หัว context ให้เห็นชัด
+_ROLE_RE = re.compile(
+    r"([ก-๙\.][ก-๙\s\.]{3,55}?)\s*เป็น\s*(ประธานกรรมการ|รองประธานกรรมการ|"
+    r"กรรมการและเลขานุการ|กรรมการและผู้ช่วยเลขานุการ|ผู้ช่วยเลขานุการ|เลขานุการ)")
+_ROLE_CUE = re.compile(r"คณะกรรมการ|ประธาน|เลขานุการ|องค์ประกอบ|ใครเป็น")
+
+
+def extract_roles(text: str) -> list[tuple[str, str]]:
+    """ดึง (บทบาท, ผู้ดำรงตำแหน่ง) จากตัวบทตั้งคณะกรรมการ — [] ถ้าไม่ใช่ตัวบทแบบนั้น"""
+    out, seen = [], set()
+    for m in _ROLE_RE.finditer(" ".join((text or "").split())):
+        who, role = " ".join(m.group(1).split()), m.group(2)
+        # ตัดคำเชื่อมหน้าชื่อที่ regex กวาดติดมา ("ประกอบด้วย", "และ", "โดยมี")
+        who = re.sub(r"^.*?(?:ประกอบด้วย|โดยมี|ให้|และ|,)\s*", "", who).strip()
+        if who and (role, who) not in seen:
+            seen.add((role, who))
+            out.append((role, who))
+    return out
+
+
+def format_roles(chunks: list[dict]) -> str:
+    """ตารางบทบาทจาก chunk ที่ค้นได้ — '' ถ้าไม่มีตัวบทตั้งคณะกรรมการอยู่เลย"""
+    rows, seen = [], set()
+    for c in chunks:
+        for role, who in extract_roles(c.get("text", "")):
+            key = (role, who)
+            if key not in seen:
+                seen.add(key)
+                rows.append(f"  {role:<26} : {who}  [{c.get('article', '')}]")
+    return ("ผู้ดำรงบทบาทเฉพาะที่พบในตัวบท (ดึงจากเอกสารโดยตรง):\n" + "\n".join(rows)
+            if rows else "")
 
 
 def format_chain(num: str, chain: list[dict]) -> str:
