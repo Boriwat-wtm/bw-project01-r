@@ -395,7 +395,12 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     # แต่เป็นการรับประกันว่าข้อเท็จจริงชี้ขาดอยู่ใน context แน่นอน — และตรวจย้อนได้ว่ามาจากไหน
     # ยิงเฉพาะเมื่อเข้าเงื่อนไข คำถามอื่นจึงไม่เห็นความเปลี่ยนแปลงใด ๆ
     facts = []
-    for no in rag.question_amendments(search_q):       # ถามถึง "ฉบับที่ N"
+    amend_nos = rag.question_amendments(search_q)
+    if len(amend_nos) >= 2:                            # ถามถึงหลายฉบับ -> เทียบให้เลย
+        ov = rag.amendment_overlap(amend_nos)
+        if ov:
+            facts.append(ov)
+    for no in amend_nos:                               # ถามถึง "ฉบับที่ N"
         brief = rag.amendment_brief(no)
         if brief:
             facts.append(brief)
