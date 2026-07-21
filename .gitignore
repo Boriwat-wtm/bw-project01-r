@@ -27,7 +27,9 @@ Thumbs.db
 file_hashes.json
 
 # ประวัติแชท + feedback ของ UI (local/ส่วนตัว — generated)
+# ⚠️ feedback.jsonl เก็บ "คำถาม+คำตอบจริงของผู้ใช้" (main.py:126) — ห้ามขึ้น repo
 chat_history.json
+feedback.jsonl
 
 # Databases (เก่า/generated)
 *.db

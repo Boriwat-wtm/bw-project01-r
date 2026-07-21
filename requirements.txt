@@ -1,31 +1,41 @@
+# ตรึงเวอร์ชันทั้งหมด — ชุดนี้คือชุดที่วัดผลได้ 28/30 (ดู MLflow: thai-law-rag-eval)
+# ไม่ตรึงแล้วจะแยกไม่ออกว่าคะแนนเปลี่ยนเพราะโค้ดเราหรือเพราะ dependency อัปเดตเอง
+# อัปเดตเวอร์ชันเมื่อไร -> รัน eval/smoke_test.py + run_eval.py ใหม่ก่อนเสมอ
+
 # UI (chatbot)
-streamlit             # หน้าเว็บแชท — รัน: streamlit run app.py
+streamlit==1.59.2             # หน้าเว็บแชท — รัน: streamlit run app.py
 
 # API (ให้ภายนอกเรียก) — รัน: uvicorn main:app --port 8000
-fastapi
-uvicorn[standard]     # ASGI server
+fastapi==0.139.2
+uvicorn[standard]==0.51.0     # ASGI server
+pydantic==2.13.4              # schema ของ request/response ใน main.py
 
 # OCR (local — สำหรับ PDF สแกน/รูปภาพ เช่น ราชกิจจานุเบกษา)
-easyocr               # OCR ภาษาไทย รันในเครื่อง (ใช้ GPU ถ้ามี) ไม่ต่อเน็ต
-pymupdf               # render หน้า PDF -> รูป ก่อนส่งเข้า OCR
+easyocr==1.7.2                # OCR ภาษาไทย รันในเครื่อง (ใช้ GPU ถ้ามี) ไม่ต่อเน็ต
+pymupdf==1.28.0               # คัดข้อความไทย + render หน้า PDF -> รูปก่อนส่งเข้า OCR
+                              # ⚠️ ห้ามเปลี่ยนไป pdfplumber — เรียงสระ/วรรณยุกต์ไทยผิด (rag.py:147)
 
 # RAG core
-python-dotenv         # โหลด endpoint/API key จาก .env (ไม่ hardcode ในโค้ด)
-chromadb              # vector store (semantic) + เก็บ metadata/กรอง group ในตัว
-langchain-openai      # chat LLM ผ่าน OpenAI-compatible endpoint
-langchain-ollama      # embeddings (paraphrase-multilingual)
-langchain-core
-rank_bm25
-pdfplumber
+python-dotenv==1.2.2          # โหลด endpoint/API key จาก .env (ไม่ hardcode ในโค้ด)
+chromadb==1.5.9               # vector store (semantic) + เก็บ metadata/กรอง group ในตัว
+langchain-openai==1.3.5       # chat LLM ผ่าน OpenAI-compatible endpoint
+langchain-ollama==1.1.0       # embeddings (paraphrase-multilingual)
+langchain-core==1.4.9
+rank_bm25==0.2.2              # keyword search (คู่กับ semantic แล้วรวมด้วย RRF)
+pythainlp==5.3.4              # ⚠️ จำเป็น — ตัดคำไทยให้ BM25 (newmm) ไทยไม่เว้นวรรค
+                              #    ถ้าไม่มี rag.py จะ fallback เป็น bigram เงียบ ๆ แล้วค้นแย่ลง
+numpy==2.4.4
 
-# eval / ground truth (FIFA dataset scripts)
-pandas
+# eval / ground truth (eval/run_eval.py, eval/smoke_test.py)
+pandas==2.3.3
 
-# experiment tracking (log ผลขึ้น MLflow server)
-mlflow
-openpyxl              # export ตารางผลเป็น .xlsx (artifact)
+# experiment tracking (log ผลขึ้น MLflow server — ตั้ง MLFLOW_TRACKING_URI ใน .env)
+mlflow==3.14.0
+openpyxl==3.1.5               # export ตารางผลเป็น .xlsx (artifact)
 
 # cross-encoder reranker (RAG_RERANK=1 หรือ --rerank) — RRF top-N → rerank → top-K
-# ⚠️ torch ต้องเป็นเวอร์ชัน CUDA ถ้ามี GPU:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu124
-sentence-transformers  # โมเดล default: BAAI/bge-reranker-v2-m3 (multilingual)
+sentence-transformers==5.6.0  # โมเดล default: BAAI/bge-reranker-v2-m3 (multilingual)
+transformers==5.14.1
+# ⚠️ torch ไม่ตรึงไว้ที่นี่เพราะ build ผูกกับ CUDA ของแต่ละเครื่อง (ของเรา 2.6.0+cu124)
+#    มี GPU: pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#    ไม่มี GPU: pip install torch==2.6.0   (reranker จะรันบน CPU — ช้ากว่ามาก)
