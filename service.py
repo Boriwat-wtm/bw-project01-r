@@ -228,6 +228,41 @@ def build_user_prompt(question: str, context: str, domain: str = "thai_law") -> 
     )
 
 
+def _retrieve_live(**kw) -> Iterator[dict]:
+    """เรียก rag.retrieve() แล้ว yield {"stage": ...} ออกมา "ตามเวลาจริง"
+
+    ⚠️ retrieve ไม่ใช่ generator ถ้าเก็บ stage ใส่ list แล้ว yield ทีหลัง ผู้ใช้จะเห็น
+    ข้อความค้างอยู่ ๖๐ วินาทีแล้วโผล่พรวดเดียวตอนจบ ซึ่งไม่ต่างจากไม่มีเลย
+    จึงรันในเธรดแยกแล้วส่ง stage ผ่านคิว — ไม่ต้องรื้อ retrieve ให้เป็น generator
+    ซึ่งจะกระทบผู้เรียกทุกที่ (eval, FastAPI, CLI)
+
+    ผลลัพธ์ส่งกลับผ่าน StopIteration.value → ผู้เรียกใช้ `chunks = yield from ...`"""
+    import queue
+    import threading
+    q: "queue.Queue" = queue.Queue()
+    box: dict = {}
+
+    def work():
+        try:
+            box["out"] = rag.retrieve(on_stage=q.put, **kw)
+        except BaseException as e:      # เก็บไว้โยนต่อในเธรดหลัก จะได้ traceback ตามปกติ
+            box["err"] = e
+        finally:
+            q.put(None)
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    while True:
+        s = q.get()
+        if s is None:
+            break
+        yield {"stage": s}
+    t.join()
+    if "err" in box:
+        raise box["err"]
+    return box.get("out", [])
+
+
 def _stream_answer(llm, messages, stream: bool):
     """ยิง messages เข้า LLM แล้ว yield token — ใช้ร่วมกันทั้งสองเส้นทาง
     คืน (answer, reasoning) ผ่าน StopIteration value ของ generator"""
@@ -348,10 +383,13 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     domain = rag.domain_of_group(groups_used[0]) if groups_used else "thai_law"
 
     # 2) ขยายคำถาม (multi-query) + 3) retrieve (hybrid RRF + filter + rerank)
-    yield {"stage": "ค้นเอกสาร"}
+    #    ซอย stage ให้ละเอียด — ช่วงนี้กินเวลาหลายสิบวินาที ถ้าเงียบผู้ใช้จะคิดว่าค้าง
+    yield {"stage": "แตกคำถามเป็นหลายมุมค้นหา"}
     search_qs = rag.expand_queries(llm, search_q, domain=domain)
-    chunks = rag.retrieve(search_qs, rerank_query=search_q, groups=filter_groups,
-                          years=year_filter, versions=versions or None)
+
+    chunks = yield from _retrieve_live(
+        query=search_qs, rerank_query=search_q, groups=filter_groups,
+        years=year_filter, versions=versions or None)
     # ── เติม "ข้อมูลที่คำนวณจากเอกสารด้วยโค้ด" ไว้หัว context ────────────────
     # ไม่ใช่การสั่ง LLM ผ่าน prompt (ซึ่งกระทบทุกคำถามและโมเดลอาจไม่ทำตาม)
     # แต่เป็นการรับประกันว่าข้อเท็จจริงชี้ขาดอยู่ใน context แน่นอน — และตรวจย้อนได้ว่ามาจากไหน

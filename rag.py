@@ -966,7 +966,8 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
              rerank_query: "Optional[str]" = None,
              groups: "Optional[list[str]]" = None,
              years: "Optional[list[int]]" = None,
-             versions: "Optional[list[int]]" = None) -> list[dict]:
+             versions: "Optional[list[int]]" = None,
+             on_stage: "Optional[Callable[[str], None]]" = None) -> list[dict]:
     """retrieve แบบ hybrid (semantic + BM25 รวมด้วย RRF)
     query เป็น str เดียว หรือ list[str] (multi-query RAG-Fusion):
       หลาย query → ค้นแยกกันทุกอัน แล้ว RRF รวม "ทุก ranked list" → top-k
@@ -1013,8 +1014,13 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
             allowed = None         # ไม่มี chunk ตรงเลย → ไม่กรอง (fallback กัน empty)
     n_res = max(1, min(pool, _collection.count()))
 
+    # รายงานความคืบหน้าออกไปให้ UI แสดง — ขั้นตอนพวกนี้ใช้เวลารวมกันหลายสิบวินาที
+    # ถ้าไม่บอกอะไรเลยผู้ใช้จะคิดว่าโปรแกรมค้าง
+    say = on_stage or (lambda _s: None)
+
     fuse: dict[str, float] = {}
-    for q in queries:
+    for qi, q in enumerate(queries, 1):
+        say(f"ค้นมุมที่ {qi}/{len(queries)} จาก {len(_chunks):,} ตัวบท")
         # 1) semantic (Chroma cosine + กรอง group ด้วย where ในตัว)
         qv = _embeddings.embed_query(q)
         res = _collection.query(query_embeddings=[qv], n_results=n_res, where=where)
@@ -1044,11 +1050,15 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
         # ⚠️ ให้ reranker คืนทั้ง pool (ไม่ใช่แค่ k) แล้วค่อย demote/boost แล้วจึงตัด k
         #    ถ้าตัด k ก่อน มาตราที่ผู้ใช้ถามอาจไม่ติด k ตัวแรก → ไม่มีอะไรให้ boost
         n = max(RERANK_TOP_N, k)
+        say(f"จัดอันดับ {min(n, len(ranked))} ก้อนที่ใกล้เคียงที่สุด")
         ranked = rerank(rerank_query, ranked[:n], n)
     ranked = _demote_scans(ranked)
     # ลำดับสำคัญ: ดันฉบับที่อ้างถึงก่อน แล้วค่อยดันมาตราที่ถาม (มาตราชนะเพราะเจาะกว่า)
     ranked = _boost_amend(ranked, question_amendments(q_raw))
-    return _boost_exact_article(ranked, wanted)[:k]
+    out = _boost_exact_article(ranked, wanted)[:k]
+    arts = [c.get("article", "") for c in out[:4] if c.get("article")]
+    say("เจอ " + (", ".join(arts) if arts else f"{len(out)} ก้อน"))
+    return out
 
 
 def status_label(c: dict) -> str:

@@ -327,12 +327,20 @@ def get_years() -> list[int]:
 
 
 # ข้อความ progress ต่อ "stage" ที่ service.answer_stream ส่งมา (เฉพาะฝั่ง Streamlit)
-_STAGE_LABEL = {
-    "เข้าใจคำถามต่อเนื่อง": "กำลังทำความเข้าใจคำถามต่อเนื่อง...",
-    "เลือกกลุ่มเอกสาร": "🧭 กำลังเลือกกลุ่มเอกสาร...",
-    "ค้นเอกสาร": "🔎 กำลังค้นเอกสาร...",
-    "เขียนคำตอบ": "📄 กำลังเขียนคำตอบ...",
+# ป้ายบอกว่ากำลังทำอะไร — คำถามหนึ่งใช้เวลา 15-60 วินาที ถ้าไม่บอกอะไรเลยผู้ใช้จะคิดว่าค้าง
+# stage ที่ไม่มีในนี้จะแสดงข้อความดิบ (เช่น "เจอ มาตรา ๙, มาตรา ๙/๑" ที่ retrieve ส่งมา)
+_STAGE_ICON = {
+    "เข้าใจคำถามต่อเนื่อง": "💬",
+    "เลือกกลุ่มเอกสาร": "🧭",
+    "แตกคำถามเป็นหลายมุมค้นหา": "🧩",
+    "เขียนคำตอบ": "✍️",
 }
+
+
+def stage_label(stage: str, t0: float) -> str:
+    """ป้ายสถานะ + เวลาที่ผ่านไป — ตัวเลขที่เดินอยู่คือสัญญาณว่ายังทำงาน ไม่ได้ค้าง"""
+    icon = next((v for k, v in _STAGE_ICON.items() if stage.startswith(k)), "🔎")
+    return f"{icon} {stage}  ·  {time.time() - t0:.0f} วินาที"
 
 
 def answer_question(llm, question, placeholder, status, stream,
@@ -341,20 +349,21 @@ def answer_question(llm, question, placeholder, status, stream,
     """ตัวบริโภคฝั่ง Streamlit — วนรับเหตุการณ์จาก service.answer_stream() แล้วเขียนลง UI
     (logic ทั้งหมดอยู่ service.py; ตรงนี้แค่ 'แสดงผล') คืน tuple เดิมให้ caller ไม่ต้องแก้"""
     answer, chunks, reasoning, groups_used, elapsed, search_q = "", [], "", [], 0.0, ""
+    t0 = time.time()
     for ev in service.answer_stream(
         llm, question, auto_group=auto_group, all_groups=all_groups,
         manual_groups=manual_groups, year_filter=year_filter,
         history=history, stream=stream,
     ):
         if "stage" in ev:
-            status.update(label=_STAGE_LABEL.get(ev["stage"], ev["stage"]))
+            status.update(label=stage_label(ev["stage"], t0))
         elif "token" in ev:
             answer += ev["token"]
             placeholder.markdown(answer + " ▌")
         elif "meta" in ev:
             groups_used = ev["meta"]["groups"]
-            status.update(label=f"📄 [{', '.join(groups_used)}] พบ "
-                                f"{ev['meta']['n_sources']} ชิ้น — กำลังเขียนคำตอบ...")
+            status.update(label=stage_label(
+                f"อ่านตัวบท {ev['meta']['n_sources']} ก้อน จาก {', '.join(groups_used)}", t0))
         elif "final" in ev:
             f = ev["final"]
             answer, chunks, reasoning = f["answer"], f["chunks"], f["reasoning"]
