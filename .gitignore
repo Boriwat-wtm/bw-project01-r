@@ -34,6 +34,8 @@ feedback.jsonl
 # Databases (เก่า/generated)
 *.db
 chroma_db/
+# ดัชนีคู่ขนานตอนทดลองเทียบ embedding (embed_compare.py) — .gitignore ไม่รับคอมเมนต์ท้ายบรรทัด
+chroma_db_*/
 zvec_test/zvec_db/
 *.rocksdb/
 
@@ -56,3 +58,4 @@ data/
 
 # OCR cache (generated — local)
 ocr_cache/
+ocr_cache_company/
