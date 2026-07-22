@@ -56,8 +56,11 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemma-4-26b-a4b-it")  # เสถียรกว่า qwen
 
 HERE = os.path.dirname(__file__)
-CHROMA_DIR = os.path.join(HERE, "chroma_db")          # Chroma persistent store (vectors + metadata)
-COLLECTION_NAME = "thai_law"                            # ชื่อ collection ใน Chroma
+# override ได้ด้วย env เพื่อสร้างดัชนี "คู่ขนาน" ต่างที่กัน — ใช้ตอนทดลองเทียบ embedding
+# หลายตัว (มิติเวกเตอร์ต่างกัน ต้องแยก store) โดยไม่ทับดัชนีหลักที่ใช้งานอยู่
+# ไม่ตั้ง = พฤติกรรมเดิมทุกอย่าง (chroma_db / thai_law)
+CHROMA_DIR = os.environ.get("CHROMA_DIR") or os.path.join(HERE, "chroma_db")
+COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "thai_law")
 HASH_FILE = os.path.join(HERE, "file_hashes.json")
 
 # โยนเอกสารลงโฟลเดอร์นี้ (โฟลเดอร์ย่อย = group) รองรับหลายชนิดไฟล์
@@ -1591,6 +1594,13 @@ def build_llm():
             "ยังไม่ได้ตั้ง env var LLM_API_KEY\n"
             "ตั้งถาวร (PowerShell):  setx LLM_API_KEY \"<token>\"  แล้วเปิด terminal ใหม่"
         )
+    extra = {}
+    # qwen3.x เป็น reasoning model — ถ้าไม่ปิด thinking มันเผา token ไปกับการคิดใน <think>
+    # จน max_tokens หมดก่อนออกคำตอบจริง (finish_reason=length, content ว่าง)
+    # ต้องส่งผ่าน chat_template_kwargs (top-level enable_thinking ไม่มีผลกับ endpoint นี้)
+    # gemma ไม่โดน — เงื่อนไขจับเฉพาะ qwen
+    if "qwen" in LLM_MODEL.lower():
+        extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     return ChatOpenAI(
         base_url=LLM_BASE_URL,
         api_key=LLM_API_KEY,
@@ -1599,6 +1609,7 @@ def build_llm():
         max_tokens=8000,   # เผื่อโมเดล thinking คิดยาว — ให้พื้นที่พอออก 'คำตอบจริง' หลังคิดเสร็จ
         timeout=int(os.environ.get("LLM_TIMEOUT", "600")),  # กันแขวนถาวร (ตั้งผ่าน env ได้)
         max_retries=2,     # openai client ลองซ้ำเองถ้า timeout/5xx
+        **extra,
     )
 
 
