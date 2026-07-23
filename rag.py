@@ -85,6 +85,40 @@ RERANK_ENABLED = os.environ.get("RAG_RERANK") == "1"
 RERANK_MODEL   = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")  # multilingual (ไทย+อังกฤษ)
 RERANK_TOP_N   = int(os.environ.get("RERANK_TOP_N", "50"))  # candidate ที่ส่งให้ reranker ก่อนตัดเหลือ K (GPU รับไหว)
 
+# ── MLflow Tracing (เปิดด้วย env RAG_TRACE=1) ─────────────────────────────────
+# บันทึก "เส้นทางการหาคำตอบ" ของแต่ละคำถามเป็น trace: ขยายคำถาม → ค้น → rerank → ตอบ
+# ดูใน MLflow UI แท็บ Traces: แต่ละขั้นรับอะไรเข้า คืนอะไรออก ใช้เวลากี่วินาที
+# ปิดอยู่ (ค่าเริ่มต้น) = ไม่ import mlflow เลย — pipeline หลักไม่มี overhead ใด ๆ
+TRACE_ENABLED = os.environ.get("RAG_TRACE") == "1"
+if TRACE_ENABLED:
+    import mlflow
+    if os.environ.get("MLFLOW_EXPERIMENT"):
+        mlflow.set_experiment(os.environ["MLFLOW_EXPERIMENT"])
+
+
+def _traced(span_type: str = "UNKNOWN"):
+    """decorator: ห่อฟังก์ชันเป็น span ใน trace — ถ้าปิด trace คืนฟังก์ชันเดิมเป๊ะ ๆ"""
+    def deco(fn):
+        if not TRACE_ENABLED:
+            return fn
+        return mlflow.trace(fn, name=fn.__name__, span_type=span_type)
+    return deco
+
+
+def _trace_note(name: str, inputs: "dict | None" = None, outputs: Any = None) -> None:
+    """จดผลขั้นตอนย่อยลง trace (span สั้น ๆ ใต้ฟังก์ชันที่กำลังรัน) — no-op เมื่อปิด trace"""
+    if not TRACE_ENABLED:
+        return
+    try:
+        with mlflow.start_span(name=name) as s:
+            if inputs is not None:
+                s.set_inputs(inputs)
+            if outputs is not None:
+                s.set_outputs(outputs)
+    except Exception:
+        pass   # trace เป็นเครื่องมือสังเกตการณ์ — พังก็ห้ามล้มการตอบคำถามจริง
+
+
 # globals (เซ็ตโดย build_vectorstore / _ensure_loaded)
 _chroma_client = None          # chromadb.PersistentClient
 _collection = None             # chromadb Collection (semantic + metadata, กรอง group ในตัว)
@@ -687,6 +721,7 @@ def _init_reranker():
     return _reranker
 
 
+@_traced("RERANKER")
 def rerank(query: str, items: list[dict], k: int) -> list[dict]:
     """rerank: ให้คะแนนความเกี่ยวข้อง (query, item['text']) → คืน top-k
     items = list ของ dict ที่มีคีย์ 'text' (ใช้ได้ทั้ง chunk ของ rag และ detail dict ของ experiment)
@@ -965,6 +1000,7 @@ def version_at_year(year: int) -> int:
     return best_v
 
 
+@_traced("RETRIEVER")
 def retrieve(query: "str | list[str]", k: int = TOP_K,
              rerank_query: "Optional[str]" = None,
              groups: "Optional[list[str]]" = None,
@@ -1035,6 +1071,10 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
         bm_ids = [_chunks[i]["id"] for i in order
                   if allowed is None or i in allowed][:pool]
 
+        # จดลง trace: มุมนี้แต่ละสาย (ความหมาย/คีย์เวิร์ด) เจอใครเป็น 5 อันดับแรก
+        _trace_note(f"search_q{qi}", inputs={"query": q},
+                    outputs={"semantic_top5": sem_ids[:5], "bm25_top5": bm_ids[:5]})
+
         # 3) Reciprocal Rank Fusion — สะสมข้ามทุก query (semantic + bm25 = 2 list ต่อ query)
         for r, cid in enumerate(sem_ids):
             fuse[cid] = fuse.get(cid, 0.0) + 1.0 / (60 + r)
@@ -1043,6 +1083,9 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
 
     ranked_ids = sorted(fuse, key=lambda c: -fuse[c])
     ranked = [_chunk_by_id[c] for c in ranked_ids if c in _chunk_by_id]
+    # จดลง trace: อันดับหลังรวมคะแนนทุกมุม (ก่อน dedupe/rerank/boost)
+    _trace_note("rrf_fuse", outputs={"candidates": len(ranked_ids),
+                                     "top10": ranked_ids[:10]})
     if DEDUPE_VERSIONS:            # ยุบก่อนตัด k → ไม่เสีย slot ให้ฉบับเก่าที่เนื้อหาซ้ำ
         ranked = _dedupe_versions(ranked)
     ranked = _demote_scans(ranked)  # ดัน OCR ท้ายแถวก่อนตัด pool → reranker เห็นแต่ตัวบทที่สะอาด
@@ -1715,6 +1758,7 @@ def _stream_invoke(llm: Any, messages: "list[Any]", label: str = "") -> Any:
         return AIMessage(content=content)   # เผื่อ langchain เวอร์ชันเก่าไม่รับ usage_metadata
 
 
+@_traced("CHAT_MODEL")
 def _invoke_once(llm: Any, messages: "list[Any]", label: str = "") -> Any:
     """เรียกโมเดล 1 ครั้ง + track usage — สลับ stream/ปกติ ตาม STREAM_ENABLED"""
     if STREAM_ENABLED:
@@ -1724,6 +1768,7 @@ def _invoke_once(llm: Any, messages: "list[Any]", label: str = "") -> Any:
     return resp
 
 
+@_traced("LLM")
 def invoke_retry(llm: Any, messages: "list[Any]", ok_fn: "Optional[Callable[[str], bool]]" = None,
                  max_retries: int = 2, label: str = "") -> Any:
     """llm.invoke + track_usage + retry ถ้า ok_fn(content) เป็น False (output หล่น/ผิดปกติ)
@@ -1756,6 +1801,7 @@ def expand_query(llm: Any, question: str) -> str:
     return question
 
 
+@_traced("LLM")
 def expand_queries(llm: Any, question: str, n: int = 3, domain: str = "thai_law") -> list[str]:
     """Multi-query (RAG-Fusion): คืน n+1 query = [คำถามต้นฉบับ] + n มุมที่ generate
       query[0] = คำถามต้นฉบับ (raw) — สัญญาณ semantic สะอาด ไม่ถูก keyword เบือน
@@ -1779,6 +1825,7 @@ def expand_queries(llm: Any, question: str, n: int = 3, domain: str = "thai_law"
     return queries
 
 
+@_traced("CHAIN")
 def run_agent(llm: Any, question: str) -> str:
     """Direct RAG: ขยายคำถาม -> retrieve (hybrid) -> ส่ง context ให้ LLM ตอบ
     (พารามิเตอร์ชื่อเดิมเพื่อ compatibility กับ batch_test.py)"""
