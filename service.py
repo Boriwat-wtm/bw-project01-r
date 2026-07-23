@@ -71,6 +71,7 @@ _COMPARE_HINT = re.compile(
 )
 
 
+@rag.traced("TOOL")
 def detect_compare(question: str) -> str:
     """คำถามนี้ต้องการ 'ไล่ตัวบทข้ามฉบับ' ไหม -> คืนเลขมาตราที่ถาม ('' = ไม่ใช่)
 
@@ -83,6 +84,7 @@ def detect_compare(question: str) -> str:
     return arts[0] if arts else ""
 
 
+@rag.traced("TOOL")
 def pick_groups(question: str, all_groups: list[str]) -> tuple[list[str], list[int], list[int]]:
     """ตัดสิน 'ควรค้นกลุ่มไหน' ด้วยกฎในโค้ด ไม่ใช่ให้ LLM เดา
     เหตุผล: 'กฎหมายฉบับไหนใช้บังคับอยู่' เป็นข้อเท็จจริง ไม่ใช่เรื่องตีความ
@@ -186,6 +188,7 @@ def recent_turns(history: list, n: int = HISTORY_TURNS) -> list:
     return out[-(n * 2):]
 
 
+@rag.traced("LLM")
 def rewrite_followup(llm, question: str, history: list) -> str:
     """แปลงคำถามต่อเนื่องให้ "สมบูรณ์ในตัว" ก่อนเอาไปค้น/เลือกกลุ่ม
     เช่น "แล้วโทษล่ะ" + ประวัติ → "โทษของการบุกรุกที่ดินของรัฐตามมาตรา ๙ คืออะไร"
@@ -240,14 +243,19 @@ def _retrieve_live(**kw) -> Iterator[dict]:
     ซึ่งจะกระทบผู้เรียกทุกที่ (eval, FastAPI, CLI)
 
     ผลลัพธ์ส่งกลับผ่าน StopIteration.value → ผู้เรียกใช้ `chunks = yield from ...`"""
+    import contextvars
     import queue
     import threading
     q: "queue.Queue" = queue.Queue()
     box: dict = {}
+    # trace context (RAG_TRACE=1) เป็นของประจำเธรด — ก๊อปไปให้เธรดลูกด้วย
+    # ไม่งั้น span ของ retrieve จะหลุดเป็น trace แยก ไม่เกาะใต้ answer_stream
+    # (ตอนปิด trace: ctx.run ก็แค่รันฟังก์ชันตามปกติ ไม่มีผลอะไร)
+    ctx = contextvars.copy_context()
 
     def work():
         try:
-            box["out"] = rag.retrieve(on_stage=q.put, **kw)
+            box["out"] = ctx.run(lambda: rag.retrieve(on_stage=q.put, **kw))
         except BaseException as e:      # เก็บไว้โยนต่อในเธรดหลัก จะได้ traceback ตามปกติ
             box["err"] = e
         finally:
@@ -291,6 +299,11 @@ def _stream_answer(llm, messages, stream: bool):
             answer = reasoning
         if full is not None:
             rag.track_usage(full)
+        # จดลง trace: สาย stream เรียก llm.stream ตรง ๆ ไม่ผ่าน invoke_retry
+        # เลยไม่มี span LLM ของตัวเอง — จด prompt+คำตอบเต็มไว้ตรงนี้แทน
+        rag.trace_note("llm_stream_answer",
+                       inputs={"messages": [str(getattr(m, "content", "")) for m in messages]},
+                       outputs={"answer": answer, "reasoning": reasoning})
     else:
         resp = rag.invoke_retry(llm, messages,
                                 ok_fn=lambda c: not rag.looks_truncated(c), label="answer")
@@ -432,3 +445,25 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     yield {"final": {"answer": answer, "chunks": chunks, "reasoning": reasoning,
                      "groups_used": groups_used, "elapsed": time.perf_counter() - t0,
                      "search_q": search_q if search_q != question else ""}}
+
+
+# ── MLflow Tracing: ครอบ answer_stream เป็น span ราก (เปิดด้วย RAG_TRACE=1 — ดู rag.py) ──
+# answer_stream เป็น generator: mlflow.trace รองรับโดยเก็บ "ทุกค่าที่ yield" เป็น output
+# ซึ่งตอน streaming = token ทีละตัวเป็นร้อย ๆ event → ใช้ output_reducer คัดทิ้ง
+# เหลือเฉพาะ event สรุป (stage/meta/final) — เนื้อคำตอบเต็มมีใน final อยู่แล้ว
+if rag.TRACE_ENABLED:
+    import mlflow
+
+    def _reduce_stream_events(outputs: list) -> dict:
+        keep = [o for o in outputs
+                if isinstance(o, dict) and not (o.keys() & {"token", "reasoning"})]
+        n_tok = sum(1 for o in outputs if isinstance(o, dict) and "token" in o)
+        return {"n_token_events": n_tok, "events": keep}
+
+    try:
+        answer_stream = mlflow.trace(answer_stream, name="answer_stream",
+                                     span_type="CHAIN",
+                                     output_reducer=_reduce_stream_events)
+    except TypeError:   # mlflow รุ่นที่ไม่มี output_reducer — เก็บทุก event (บวมแต่ใช้ได้)
+        answer_stream = mlflow.trace(answer_stream, name="answer_stream",
+                                     span_type="CHAIN")

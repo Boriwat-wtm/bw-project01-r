@@ -96,7 +96,7 @@ if TRACE_ENABLED:
         mlflow.set_experiment(os.environ["MLFLOW_EXPERIMENT"])
 
 
-def _traced(span_type: str = "UNKNOWN"):
+def traced(span_type: str = "UNKNOWN"):
     """decorator: ห่อฟังก์ชันเป็น span ใน trace — ถ้าปิด trace คืนฟังก์ชันเดิมเป๊ะ ๆ"""
     def deco(fn):
         if not TRACE_ENABLED:
@@ -105,7 +105,7 @@ def _traced(span_type: str = "UNKNOWN"):
     return deco
 
 
-def _trace_note(name: str, inputs: "dict | None" = None, outputs: Any = None) -> None:
+def trace_note(name: str, inputs: "dict | None" = None, outputs: Any = None) -> None:
     """จดผลขั้นตอนย่อยลง trace (span สั้น ๆ ใต้ฟังก์ชันที่กำลังรัน) — no-op เมื่อปิด trace"""
     if not TRACE_ENABLED:
         return
@@ -721,7 +721,7 @@ def _init_reranker():
     return _reranker
 
 
-@_traced("RERANKER")
+@traced("RERANKER")
 def rerank(query: str, items: list[dict], k: int) -> list[dict]:
     """rerank: ให้คะแนนความเกี่ยวข้อง (query, item['text']) → คืน top-k
     items = list ของ dict ที่มีคีย์ 'text' (ใช้ได้ทั้ง chunk ของ rag และ detail dict ของ experiment)
@@ -1000,7 +1000,7 @@ def version_at_year(year: int) -> int:
     return best_v
 
 
-@_traced("RETRIEVER")
+@traced("RETRIEVER")
 def retrieve(query: "str | list[str]", k: int = TOP_K,
              rerank_query: "Optional[str]" = None,
              groups: "Optional[list[str]]" = None,
@@ -1072,7 +1072,7 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
                   if allowed is None or i in allowed][:pool]
 
         # จดลง trace: มุมนี้แต่ละสาย (ความหมาย/คีย์เวิร์ด) เจอใครเป็น 5 อันดับแรก
-        _trace_note(f"search_q{qi}", inputs={"query": q},
+        trace_note(f"search_q{qi}", inputs={"query": q},
                     outputs={"semantic_top5": sem_ids[:5], "bm25_top5": bm_ids[:5]})
 
         # 3) Reciprocal Rank Fusion — สะสมข้ามทุก query (semantic + bm25 = 2 list ต่อ query)
@@ -1084,7 +1084,7 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
     ranked_ids = sorted(fuse, key=lambda c: -fuse[c])
     ranked = [_chunk_by_id[c] for c in ranked_ids if c in _chunk_by_id]
     # จดลง trace: อันดับหลังรวมคะแนนทุกมุม (ก่อน dedupe/rerank/boost)
-    _trace_note("rrf_fuse", outputs={"candidates": len(ranked_ids),
+    trace_note("rrf_fuse", outputs={"candidates": len(ranked_ids),
                                      "top10": ranked_ids[:10]})
     if DEDUPE_VERSIONS:            # ยุบก่อนตัด k → ไม่เสีย slot ให้ฉบับเก่าที่เนื้อหาซ้ำ
         ranked = _dedupe_versions(ranked)
@@ -1284,6 +1284,7 @@ def amendment_graph() -> dict:
     return g
 
 
+@traced("TOOL")
 def article_chain(num: str) -> list[dict]:
     """สายการแก้ไขเต็มของมาตรา num เรียงเก่า -> ใหม่ (รวมต้นสายที่อยู่นอก corpus)
     ตอบคำถามแนว 'ถูกแก้กี่ครั้ง / ก่อนหน้าของก่อนหน้าคือฉบับใด' ได้แบบไม่ต้องเดา"""
@@ -1325,6 +1326,7 @@ _EFFECTIVE_RE = re.compile(
     r"มาตรา\s*๒\s*(พระราชบัญญัตินี้ให้ใช้บังคับ[^“”]{0,180}?(?:ราชกิจจานุเบกษา|เป็นต้นไป))")
 
 
+@traced("TOOL")
 def amendment_brief(no: int) -> str:
     """สรุป 'ฉบับที่ N ทำอะไรบ้าง' จากตัวเอกสารเอง — วันมีผลบังคับ + มาตราที่แก้ + แก้ทับใคร
 
@@ -1390,6 +1392,7 @@ def format_roles(chunks: list[dict]) -> str:
             if rows else "")
 
 
+@traced("TOOL")
 def amendment_overlap(nos: list[int]) -> str:
     """เทียบว่า พ.ร.บ.แก้ไขหลายฉบับ 'เกี่ยวข้องกัน' หรือไม่ โดยดูมาตราที่แก้ร่วมกัน
 
@@ -1427,6 +1430,7 @@ def format_chain(num: str, chain: list[dict]) -> str:
     return "\n".join(lines)
 
 
+@traced("TOOL")
 def article_timeline(num: str) -> list[dict]:
     """ไล่ตัวบท 'มาตรา num' ข้ามทุกฉบับตามลำดับเวลา แล้วยุบช่วงที่ตัวบทไม่เปลี่ยน
     คืนเฉพาะ 'จุดที่เนื้อหาเปลี่ยนจริง' -> [{version, as_of_year, doc_label, text, in_force}]
@@ -1758,7 +1762,7 @@ def _stream_invoke(llm: Any, messages: "list[Any]", label: str = "") -> Any:
         return AIMessage(content=content)   # เผื่อ langchain เวอร์ชันเก่าไม่รับ usage_metadata
 
 
-@_traced("CHAT_MODEL")
+@traced("CHAT_MODEL")
 def _invoke_once(llm: Any, messages: "list[Any]", label: str = "") -> Any:
     """เรียกโมเดล 1 ครั้ง + track usage — สลับ stream/ปกติ ตาม STREAM_ENABLED"""
     if STREAM_ENABLED:
@@ -1768,7 +1772,7 @@ def _invoke_once(llm: Any, messages: "list[Any]", label: str = "") -> Any:
     return resp
 
 
-@_traced("LLM")
+@traced("LLM")
 def invoke_retry(llm: Any, messages: "list[Any]", ok_fn: "Optional[Callable[[str], bool]]" = None,
                  max_retries: int = 2, label: str = "") -> Any:
     """llm.invoke + track_usage + retry ถ้า ok_fn(content) เป็น False (output หล่น/ผิดปกติ)
@@ -1801,7 +1805,7 @@ def expand_query(llm: Any, question: str) -> str:
     return question
 
 
-@_traced("LLM")
+@traced("LLM")
 def expand_queries(llm: Any, question: str, n: int = 3, domain: str = "thai_law") -> list[str]:
     """Multi-query (RAG-Fusion): คืน n+1 query = [คำถามต้นฉบับ] + n มุมที่ generate
       query[0] = คำถามต้นฉบับ (raw) — สัญญาณ semantic สะอาด ไม่ถูก keyword เบือน
@@ -1825,7 +1829,7 @@ def expand_queries(llm: Any, question: str, n: int = 3, domain: str = "thai_law"
     return queries
 
 
-@_traced("CHAIN")
+@traced("CHAIN")
 def run_agent(llm: Any, question: str) -> str:
     """Direct RAG: ขยายคำถาม -> retrieve (hybrid) -> ส่ง context ให้ LLM ตอบ
     (พารามิเตอร์ชื่อเดิมเพื่อ compatibility กับ batch_test.py)"""
