@@ -129,7 +129,7 @@ def log_mlflow(results: list, mode: str, out_path: str, run_idx: int, tag: str) 
             "elapsed_total_s": sum(r["elapsed"] for r in results),
             "elapsed_avg_s": sum(r["elapsed"] for r in results) / n,
             **{f"pass_{k}": sum(r["passed"] for r in lv(k)) for k in
-               ("easy", "medium", "hard") if lv(k)},
+               ("easy", "medium", "hard", "veryhard") if lv(k)},
         })
         # ผ่าน/ตก รายข้อ เก็บเป็น metric เพื่อ plot เทียบข้ามรอบได้ว่าข้อไหนแกว่ง
         for r in results:
@@ -141,7 +141,7 @@ def log_mlflow(results: list, mode: str, out_path: str, run_idx: int, tag: str) 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--level", choices=["easy", "medium", "hard"])
+    ap.add_argument("--level", choices=["easy", "medium", "hard", "veryhard"])
     ap.add_argument("--id", nargs="*")
     ap.add_argument("--retrieval", action="store_true",
                     help="วัดเฉพาะ retrieval ไม่เรียก LLM")
@@ -149,9 +149,13 @@ def main():
                     help="รันซ้ำกี่รอบ — LLM ให้ผลไม่คงที่ 100% ควรรัน 3 รอบแล้วดูค่าเฉลี่ย")
     ap.add_argument("--mlflow", action="store_true", help="ส่งผลขึ้น MLflow")
     ap.add_argument("--tag", default="eval", help="ชื่อกำกับ run ใน MLflow")
+    # ชุดคำถามอื่นที่ใช้ schema เดียวกัน เช่น adversarial.json (ชุดคำถามหลอก —
+    # วัดว่าระบบ "รู้ตัวว่าไม่รู้" มั้ย ต้องปฏิเสธเมื่อคำตอบไม่อยู่ในเอกสาร)
+    ap.add_argument("--file", default="ground_truth.json",
+                    help="ไฟล์ชุดคำถาม (ใน eval/) — default: ground_truth.json")
     args = ap.parse_args()
 
-    gt = json.load(open(os.path.join(HERE, "ground_truth.json"), encoding="utf-8"))
+    gt = json.load(open(os.path.join(HERE, args.file), encoding="utf-8"))
     items = gt["items"]
     if args.level:
         items = [i for i in items if i["level"] == args.level]
@@ -185,7 +189,7 @@ def main():
         print(f"ผ่าน {npass}/{n} ({npass/n*100:.0f}%)  |  "
               f"ข้อเท็จจริงที่จับได้ {sum(r['ratio'] for r in results)/n*100:.0f}%  |  "
               f"รวม {sum(r['elapsed'] for r in results):.0f}s")
-        for lv in ("easy", "medium", "hard"):
+        for lv in ("easy", "medium", "hard", "veryhard"):
             sub = [r for r in results if r["level"] == lv]
             if sub:
                 print(f"   {lv:<7} {sum(r['passed'] for r in sub)}/{len(sub)}")

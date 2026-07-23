@@ -48,6 +48,10 @@ mlruns/
 # ผลการทดลองที่ generated (ใหญ่มาก + มี artifact ใน MLflow แล้ว) — เก็บเฉพาะ ground_truth (dataset)
 eval/**/*.json
 !eval/ground_truth.json
+# ไฟล์ "ชุดคำถาม" ที่คัดมือ (ไม่ใช่ไฟล์ผลลัพธ์) — อนุญาตเข้า repo แบบเดียวกับ ground_truth.json
+!eval/ground_truth_v2.json
+!eval/ground_truth_v3.json
+!eval/adversarial.json
 eval/**/*.xlsx
 
 # โมเดล/แคชที่โหลดมา
