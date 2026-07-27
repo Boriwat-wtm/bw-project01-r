@@ -52,6 +52,7 @@ eval/**/*.json
 !eval/ground_truth_v2.json
 !eval/ground_truth_v3.json
 !eval/adversarial.json
+!eval/multihop.json
 eval/**/*.xlsx
 
 # โมเดล/แคชที่โหลดมา
