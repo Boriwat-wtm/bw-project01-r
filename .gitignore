@@ -53,6 +53,8 @@ eval/**/*.json
 !eval/ground_truth_v3.json
 !eval/adversarial.json
 !eval/multihop.json
+# ผลดิบของการทดลองใน experiments/ — เก็บเฉพาะโค้ด ไม่เก็บไฟล์ผลรัน
+experiments/*_[0-9]*.json
 eval/**/*.xlsx
 
 # โมเดล/แคชที่โหลดมา
