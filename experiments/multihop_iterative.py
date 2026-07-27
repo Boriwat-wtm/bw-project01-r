@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""ต้นแบบ iterative multi-hop retrieval — ใช้ "ทดลองเทียบ" กับระบบปัจจุบันเท่านั้น
+"""ทดลองเทียบ 3 วิธีตอบคำถาม "ต้อง hop จริง" — ไม่ได้ต่อเข้าแอปจริง
 
-ระบบปัจจุบัน (service.answer_stream):
-    คำถาม -> แตก 4 มุม (พร้อมกัน) -> ค้นรอบเดียว -> rerank -> ตอบ
-    hop ที่ทำได้ = hop ที่คำนวณล่วงหน้าไว้ในกราฟการแก้ไข (article_chain/timeline)
+    A) baseline_multiquery_graph  = ระบบปัจจุบัน (service.answer_stream)
+       คำถาม -> แตก 4 มุมพร้อมกัน -> ค้นรอบเดียว -> rerank -> ตอบ
+       hop ที่ทำได้ = hop ที่คำนวณล่วงหน้าไว้ในกราฟการแก้ไข (article_chain/timeline)
 
-ต้นแบบนี้ (iterative):
-    คำถาม -> ค้นรอบ 1 -> ให้ LLM อ่านผลแล้วตัดสินใจว่า "ยังขาดอะไร ต้องค้นอะไรต่อ"
-          -> ค้นรอบ 2 (ด้วยคำค้นที่ LLM คิดเอง) -> รวม context ทุกรอบ -> ตอบ
+    B) iterative_multihop_llm     = ให้ LLM คิดคำค้นรอบสองเอง
+       ค้นรอบ 1 -> LLM อ่านผลแล้วบอก "ยังขาดอะไร ค้นอะไรต่อ" -> ค้นรอบ 2 -> ตอบ
+       ⚠️ เสี่ยง: คืนอำนาจตัดสินใจให้โมเดล = ผลไม่นิ่ง (รอบแรกที่ลอง เลือก entity ผิด)
 
-⚠️ ไม่ได้ต่อเข้าแอปจริง และตั้งใจไม่ต่อ จนกว่าตัวเลขจะบอกว่าคุ้ม
-   เพราะการให้ LLM ตัดสินใจว่าจะค้นอะไรต่อ = คืนอำนาจตัดสินใจกลับไปให้โมเดล
-   ซึ่งสวนทางกับหลักการของโปรเจกต์ ("ข้อเท็จจริงให้โค้ดคำนวณ") และทำให้ผลไม่นิ่ง
+    C) entityhop_code             = ให้ "โค้ด" สกัด entity แล้วค้นรอบสองอัตโนมัติ
+       ค้นรอบ 1 -> regex ดึงตำแหน่ง/องค์กร/ชื่อเอกสารจากตัวบทที่ค้นได้ -> ค้นรอบ 2 -> ตอบ
+       ตรงหลักการโปรเจกต์: "ข้อเท็จจริงให้โค้ดคำนวณ การเรียบเรียงให้ LLM"
 
-    python experiments/multihop_iterative.py --id H2H1        # ทดลองข้อเดียว
-    python experiments/multihop_iterative.py --all --hops 2   # ทั้งชุด
+ทุกวิธีให้คะแนนด้วย run_eval.score_item ตัวเดียวกับ eval หลัก -> เทียบกันได้ตรง ๆ
+เปิด RAG_TRACE=1 จะได้ trace คนละต้นต่อวิธี ชื่อตามด้านบน (เทียบใน MLflow ได้เลย)
+
+    python experiments/multihop_iterative.py --id H2H1              # 3 วิธี 1 ข้อ
+    python experiments/multihop_iterative.py --id H2H1 --mode B     # เฉพาะวิธี B
+    python experiments/multihop_iterative.py --all                  # ทั้งชุด 8 ข้อ
 """
 import argparse
 import json
@@ -73,6 +77,95 @@ def plan_followup(llm, question: str, context: str, max_ctx: int = 6000) -> list
     return qs[:2]
 
 
+# ── วิธี C: ให้ "โค้ด" สกัด entity จากตัวบทรอบแรก แทนที่จะให้ LLM คิดคำค้นเอง ──────
+# ทำไมต้องเป็น regex ไม่ใช่ LLM: รอบแรกที่ลองวิธี B โมเดลขอค้น "เจ้าพนักงานที่ดิน"
+# ทั้งที่ตัวบทเขียนว่า "อธิบดี" — คนละตำแหน่งกันในกฎหมาย ผลคือ hop รอบสองไปผิดทาง
+# การดึงคำจากตัวบทตรง ๆ ไม่มีทางเพี้ยนแบบนั้น (ตรวจย้อนได้ว่าคำนี้มาจากมาตราไหน)
+ACTOR_RE = re.compile(
+    r"(อธิบดี|รัฐมนตรีว่าการกระทรวงมหาดไทย|รัฐมนตรี|คณะรัฐมนตรี|"
+    r"เจ้าพนักงานที่ดินจังหวัด|เจ้าพนักงานที่ดิน|พนักงานเจ้าหน้าที่|"
+    r"ผู้ว่าราชการจังหวัด|นายอำเภอ|คณะอนุกรรมการ|คณะกรรมการ)")
+DOCUMENT_RE = re.compile(
+    r"(ใบจอง|โฉนดที่ดิน|หนังสือรับรองการทำประโยชน์|ใบไต่สวน|"
+    r"หนังสือสำคัญสำหรับที่หลวง|ใบแทน|ตราจอง)")
+
+
+def extract_hop_entities(question: str, chunks: list[dict], top: int = 2) -> list[str]:
+    """หา entity ที่ 'เพิ่งรู้จากรอบแรก' — คือโผล่ในตัวบทที่ค้นได้ แต่ไม่ได้อยู่ในคำถามเดิม
+
+    เงื่อนไข "ไม่อยู่ในคำถามเดิม" สำคัญมาก: ถ้าผู้ใช้พิมพ์ 'อธิบดี' มาเองอยู่แล้ว
+    การค้นซ้ำด้วยคำเดิมไม่ได้ข้อมูลใหม่ — hop ที่มีค่าคือ hop ไปยังสิ่งที่เพิ่งรู้"""
+    from collections import Counter
+    text = " ".join(c.get("text", "") for c in chunks)
+    counts: "Counter[str]" = Counter()
+    for rx in (ACTOR_RE, DOCUMENT_RE):
+        for m in rx.finditer(text):
+            e = m.group(1)
+            if e not in question:          # ต้องเป็นของใหม่จริง ๆ
+                counts[e] += 1
+    return [e for e, _ in counts.most_common(top)]
+
+
+def answer_entityhop(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี C: ค้นรอบ 1 -> โค้ดสกัด entity -> ค้นรอบ 2 ด้วย entity นั้น -> ตอบ
+    ไม่มี LLM call เพิ่มสำหรับการวางแผน (ต่างจากวิธี B) จึงเร็วกว่าและนิ่งกว่า"""
+    t0 = time.perf_counter()
+    g, y, v = service.pick_groups(question, groups)
+    qs1 = rag.expand_queries(llm, question)
+    chunks = rag.retrieve(qs1, rerank_query=question, groups=g,
+                          years=y or None, versions=v or None)
+    seen = {c["id"] for c in chunks}
+    all_chunks = list(chunks)
+    hop_log = [{"hop": 1, "queries": qs1, "n_new": len(chunks),
+                "articles": [c.get("article", "") for c in chunks[:6]]}]
+    if verbose:
+        arts = ", ".join(c.get("article", "") for c in chunks[:4])
+        print(f"    hop 1: ค้น {len(qs1)} คำ -> {len(chunks)} ก้อน ({arts})")
+
+    ents = extract_hop_entities(question, chunks)
+    if ents:
+        # คำค้นรอบสอง: เอา entity ที่เพิ่งรู้ ผสมกับเจตนาของคำถามเดิม
+        qs2 = [f"{e} {question}" for e in ents] + [f"อำนาจหน้าที่ของ{e}" for e in ents[:1]]
+        if verbose:
+            print(f"    โค้ดสกัดได้: {ents} -> ค้นต่อ {len(qs2)} คำ")
+        more = rag.retrieve(qs2, rerank_query=f"{' '.join(ents)} {question}", groups=g,
+                            years=y or None, versions=v or None)
+        fresh = [c for c in more if c["id"] not in seen]
+        for c in fresh:
+            seen.add(c["id"])
+        all_chunks.extend(fresh)
+        hop_log.append({"hop": 2, "queries": qs2, "entities": ents, "n_new": len(fresh),
+                        "articles": [c.get("article", "") for c in fresh[:6]]})
+        if verbose:
+            arts = ", ".join(c.get("article", "") for c in fresh[:4])
+            print(f"    hop 2: ก้อนใหม่ {len(fresh)} ({arts or '-'})")
+    elif verbose:
+        print("    โค้ดไม่เจอ entity ใหม่ -> ไม่ต้อง hop ต่อ")
+
+    context = rag.format_context(all_chunks)
+    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
+            HumanMessage(content=service.build_user_prompt(question, context))]
+    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                            label="answer-entityhop")
+    return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(all_chunks),
+            "elapsed": round(time.perf_counter() - t0, 1)}
+
+
+def answer_baseline(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี A: ระบบปัจจุบันตรง ๆ (service.answer_stream) — ไม่แตะอะไรเลย"""
+    t0 = time.perf_counter()
+    answer, chunks = "", []
+    for ev in service.answer_stream(llm, question, all_groups=groups, stream=False):
+        if "final" in ev:
+            answer = ev["final"]["answer"]
+            chunks = ev["final"]["chunks"]
+    if verbose:
+        arts = ", ".join(c.get("article", "") for c in chunks[:4])
+        print(f"    ค้นรอบเดียว -> {len(chunks)} ก้อน ({arts})")
+    return {"answer": answer, "hops": [{"hop": 1, "n_new": len(chunks)}],
+            "n_chunks": len(chunks), "elapsed": round(time.perf_counter() - t0, 1)}
+
+
 def answer_iterative(llm, question: str, groups: list, max_hops: int = 2,
                      verbose: bool = True) -> dict:
     """ตอบแบบ iterative: ค้น -> ให้ LLM ดูว่าขาดอะไร -> ค้นต่อ -> ตอบ
@@ -126,12 +219,39 @@ def score(item: dict, answer: str) -> dict:
     return run_eval.score_item(item, answer)
 
 
+# ── ทะเบียนวิธี — ชื่อในนี้คือชื่อ trace ที่จะเห็นใน MLflow ────────────────────
+MODES = {
+    "A": ("baseline_multiquery_graph", "ระบบปัจจุบัน: แตก 4 มุม ค้นรอบเดียว + กราฟ",
+          lambda llm, q, g: answer_baseline(llm, q, g)),
+    "B": ("iterative_multihop_llm", "LLM คิดคำค้นรอบสองเอง (2 รอบ)",
+          lambda llm, q, g: answer_iterative(llm, q, g, max_hops=2)),
+    "C": ("entityhop_code", "โค้ดสกัด entity แล้วค้นรอบสองอัตโนมัติ",
+          lambda llm, q, g: answer_entityhop(llm, q, g)),
+}
+
+
+def run_traced(mode: str, llm, question: str, groups: list) -> dict:
+    """รัน 1 วิธี ภายใต้ span ราก 1 อัน ชื่อตาม MODES — จะได้ trace ต้นเดียวต่อวิธี
+    เทียบกันใน MLflow ได้ตรง ๆ (ไม่เปิด trace ก็รันได้ปกติ)"""
+    name, _desc, fn = MODES[mode]
+    if not rag.TRACE_ENABLED:
+        return fn(llm, question, groups)
+    import mlflow
+    with mlflow.start_span(name=name) as span:
+        span.set_inputs({"question": question, "mode": mode, "method": name})
+        r = fn(llm, question, groups)
+        span.set_outputs({"answer": r["answer"], "n_chunks": r["n_chunks"],
+                          "n_hops": len(r["hops"]), "elapsed_s": r["elapsed"]})
+        return r
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", default="multihop.json")
     ap.add_argument("--id", nargs="*", help="ทำเฉพาะข้อที่ระบุ")
     ap.add_argument("--all", action="store_true", help="ทำทั้งชุด")
-    ap.add_argument("--hops", type=int, default=2, help="ค้นสูงสุดกี่รอบ (default 2)")
+    ap.add_argument("--mode", nargs="*", choices=list(MODES),
+                    help="เลือกวิธี (ไม่ระบุ = ทำครบ A B C)")
     args = ap.parse_args()
 
     gt = json.load(open(os.path.join(EVAL_DIR, args.file), encoding="utf-8"))
@@ -141,39 +261,47 @@ def main() -> None:
         items = [i for i in items if i["id"] in want]
     elif not args.all:
         items = items[:1]
+    modes = args.mode or list(MODES)
 
     rag._ensure_loaded()
     llm = rag.build_llm()
     groups = service.list_groups()
-    print(f"\n=== iterative multi-hop (สูงสุด {args.hops} รอบ) — {len(items)} ข้อ ===\n")
+    print(f"\n=== เทียบ {len(modes)} วิธี × {len(items)} ข้อ "
+          f"(trace: {'เปิด' if rag.TRACE_ENABLED else 'ปิด'}) ===")
+    for m in modes:
+        print(f"   {m}. {MODES[m][0]:<26} {MODES[m][1]}")
 
     results = []
     for it in items:
-        print(f"[{it['id']}] {it['q'][:70]}")
-        r = answer_iterative(llm, it["q"], groups, max_hops=args.hops)
-        sc = score(it, r["answer"])
-        results.append({**{k: it[k] for k in ("id", "level")}, **sc,
-                        "elapsed": r["elapsed"], "n_chunks": r["n_chunks"],
-                        "n_hops": len(r["hops"]), "hops": r["hops"],
-                        "q": it["q"], "gold": it["gold"], "answer": r["answer"]})
-        mark = "✅" if sc["passed"] else "❌"
-        print(f"    {mark} {sc['ratio']*100:.0f}%  {r['elapsed']}s  "
-              f"{len(r['hops'])} รอบ  {r['n_chunks']} ก้อน"
-              + ("" if sc["passed"] else f"  ขาด: {', '.join(sc['miss'])}"))
-        print(f"    ตอบ: {r['answer'][:150]}".replace("\n", " ") + "\n")
+        print(f"\n[{it['id']}] {it['q'][:72]}")
+        for m in modes:
+            name = MODES[m][0]
+            print(f"  ── {m}: {name}")
+            r = run_traced(m, llm, it["q"], groups)
+            sc = score(it, r["answer"])
+            results.append({**{k: it[k] for k in ("id", "level")}, **sc,
+                            "mode": m, "method": name, "elapsed": r["elapsed"],
+                            "n_chunks": r["n_chunks"], "n_hops": len(r["hops"]),
+                            "hops": r["hops"], "q": it["q"], "gold": it["gold"],
+                            "answer": r["answer"]})
+            mark = "✅" if sc["passed"] else "❌"
+            print(f"    {mark} {sc['ratio']*100:.0f}%  {r['elapsed']}s  "
+                  f"{len(r['hops'])} รอบ  {r['n_chunks']} ก้อน"
+                  + ("" if sc["passed"] else f"  ขาด: {', '.join(sc['miss'])}"))
 
-    n = len(results)
-    npass = sum(r["passed"] for r in results)
-    print("─" * 70)
-    print(f"iterative multi-hop: ผ่าน {npass}/{n}  "
-          f"เฉลี่ย {sum(r['elapsed'] for r in results)/n:.1f}s/ข้อ  "
-          f"เฉลี่ย {sum(r['n_chunks'] for r in results)/n:.0f} ก้อน/ข้อ")
+    print("\n" + "─" * 74)
+    print(f"{'วิธี':<28} {'ผ่าน':<8} {'เวลาเฉลี่ย':<12} {'ก้อนเฉลี่ย'}")
+    for m in modes:
+        rs = [r for r in results if r["mode"] == m]
+        n = len(rs)
+        print(f"{MODES[m][0]:<28} {sum(r['passed'] for r in rs)}/{n:<6} "
+              f"{sum(r['elapsed'] for r in rs)/n:>6.1f}s      "
+              f"{sum(r['n_chunks'] for r in rs)/n:>5.0f}")
 
-    out = os.path.join(HERE, f"multihop_iterative_{time.strftime('%Y%m%d_%H%M%S')}.json")
-    json.dump({"mode": f"iterative (max {args.hops} hops)", "passed": npass,
-               "total": n, "results": results},
+    out = os.path.join(HERE, f"hop_compare_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    json.dump({"modes": {m: MODES[m][0] for m in modes}, "results": results},
               open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print(f"ผลดิบ: {os.path.relpath(out)}")
+    print(f"\nผลดิบ: {os.path.relpath(out)}")
 
 
 if __name__ == "__main__":
