@@ -242,6 +242,79 @@ def score(item: dict, answer: str) -> dict:
     return run_eval.score_item(item, answer)
 
 
+# ── วิธี E: hop ตาม "ลิงก์" ที่ตัวบทเขียนไว้เอง (ฟิลด์ refs) ────────────────────
+# กฎหมายไทยเขียนทางเดินไว้ในตัวมันเอง: "...ให้ปฏิบัติตามมาตรา ๖๑...", "ภายใต้บังคับมาตรา ๙"
+# ตอน build ดัชนี เราเก็บลิงก์พวกนี้ไว้แล้วในฟิลด์ refs ('|9|61|') แต่ไม่เคยเอามาเดิน
+# hop แบบนี้ "นิ่ง 100%" เพราะลิงก์ไม่เปลี่ยน — input เดิม -> ผลเดิมเสมอ ไม่มี LLM เกี่ยว
+# และจบแน่นอน เพราะลิงก์ในเอกสารมีจำนวนจำกัด ไม่ใช่จินตนาการไม่รู้จบ
+def collect_refs(chunks: list[dict], max_refs: int = 4) -> list[str]:
+    """รวมเลขมาตราที่ chunk ชุดนี้ 'อ้างถึง' แต่ยังไม่มีตัวบทอยู่ในมือ
+    เรียงตามจำนวนครั้งที่ถูกอ้าง — ยิ่งหลาย chunk อ้างถึง ยิ่งน่าจะสำคัญกับคำถาม"""
+    from collections import Counter
+    have = {rag.head_article_num(c.get("article", "")) for c in chunks}
+    have.discard("")
+    cnt: "Counter[str]" = Counter()
+    for c in chunks:
+        for r in (c.get("refs") or "").strip("|").split("|"):
+            if r and r not in have:
+                cnt[r] += 1
+    return [r for r, _ in cnt.most_common(max_refs)]
+
+
+def chunks_for_article(num: str, in_force_only: bool = True) -> list[dict]:
+    """ดึง chunk ที่ 'เนื้อหาหลัก' เป็นมาตรานั้นจริง ๆ (ดูฟิลด์ article ไม่ใช่แค่เอ่ยถึง)
+    ดึงตรงจากดัชนี ไม่ผ่านการค้น -> ไม่มีทางพลาดและไม่มีทางได้ของมั่ว"""
+    num = rag.ARTICLE_ALIASES.get(num, num)
+    out = [c for c in rag._chunks
+           if rag.head_article_num(c.get("article", "")) == num
+           and (c.get("in_force") if in_force_only else True)]
+    return out[:2]                      # กัน chunk ยาว ๆ ที่ถูกหั่นหลายก้อน
+
+
+def answer_refshop(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี E: ค้นรอบ 1 -> อ่านลิงก์ refs จากก้อนที่ได้ -> ดึงมาตราปลายทางตรงจากดัชนี -> ตอบ
+    ไม่เรียก LLM วางแผน ไม่ค้นรอบสอง = นิ่งและเร็ว"""
+    t0 = time.perf_counter()
+    g, y, v = service.pick_groups(question, groups)
+    qs1 = rag.expand_queries(llm, question)
+    chunks = rag.retrieve(qs1, rerank_query=question, groups=g,
+                          years=y or None, versions=v or None)
+    seen = {c["id"] for c in chunks}
+    all_chunks = list(chunks)
+    hop_log = [{"hop": 1, "queries": qs1, "n_new": len(chunks),
+                "articles": [c.get("article", "") for c in chunks[:6]]}]
+    if verbose:
+        print(f"    hop 1: ค้น {len(qs1)} คำ -> {len(chunks)} ก้อน "
+              f"({', '.join(c.get('article', '') for c in chunks[:4])})")
+
+    refs = collect_refs(chunks)
+    if refs:
+        fresh = []
+        for r in refs:
+            for c in chunks_for_article(r):
+                if c["id"] not in seen:
+                    seen.add(c["id"])
+                    fresh.append(c)
+        all_chunks.extend(fresh)
+        hop_log.append({"hop": 2, "refs": refs, "n_new": len(fresh),
+                        "articles": [c.get("article", "") for c in fresh[:6]]})
+        if verbose:
+            print(f"    ลิงก์ที่ตัวบทเขียนไว้: มาตรา {', '.join(refs)}")
+            print(f"    hop 2: ดึงตรงจากดัชนี -> ก้อนใหม่ {len(fresh)} "
+                  f"({', '.join(c.get('article', '') for c in fresh[:4]) or '-'})")
+    elif verbose:
+        print("    ตัวบทที่ค้นได้ไม่มีลิงก์ไปมาตราอื่น -> ไม่ต้อง hop")
+
+    context = rag.format_context(all_chunks)
+    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
+            HumanMessage(content=service.build_user_prompt(question, context))]
+    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                            label="answer-refshop")
+    return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(all_chunks),
+            "stop_reason": f"เดินลิงก์ครบ {len(refs)} เส้น (โค้ดกำหนด)",
+            "elapsed": round(time.perf_counter() - t0, 1)}
+
+
 # ── บังคับปิดเส้นกราฟ เพื่อวัด "ค้นอย่างเดียว" ────────────────────────────────
 class no_graph:
     """ปิด detect_compare ชั่วคราว -> answer_stream ตกไปเส้นค้นปกติเสมอ
@@ -288,6 +361,8 @@ MODES = {
     # วิธีเสริมจากการทดลองก่อนหน้า (ไม่ได้อยู่ในชุดเทียบหลัก) — ให้โค้ดสกัด entity
     "D": ("D_entityhop_code", "โค้ดสกัด entity แล้วค้นรอบสองอัตโนมัติ",
           lambda llm, q, g: answer_entityhop(llm, q, g)),
+    "E": ("E_refs_hop", "hop ตามลิงก์ที่ตัวบทเขียนไว้เอง (ฟิลด์ refs) — นิ่ง 100%",
+          lambda llm, q, g: answer_refshop(llm, q, g)),
 }
 DEFAULT_MODES = ["A", "B", "C"]
 
