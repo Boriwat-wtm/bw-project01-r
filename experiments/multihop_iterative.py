@@ -183,6 +183,9 @@ def answer_iterative(llm, question: str, groups: list, max_hops: int = 2,
     hop_log: list[dict] = []
     queries = [question]
 
+    seen_queries: set[str] = set()
+    stop_reason = f"ชนเพดาน {max_hops} รอบ"
+
     for hop in range(1, max_hops + 1):
         # รอบแรกใช้ multi-query เหมือนระบบจริง รอบถัดไปใช้คำค้นที่ LLM คิดเอง
         qs = rag.expand_queries(llm, question) if hop == 1 else queries
@@ -198,12 +201,26 @@ def answer_iterative(llm, question: str, groups: list, max_hops: int = 2,
             print(f"    hop {hop}: ค้น {len(qs)} คำ -> ก้อนใหม่ {len(fresh)} "
                   f"({', '.join(arts[:4]) or '-'})")
 
+        # ── เบรกที่ 1 (โค้ดตัดสิน): รอบนี้ไม่ได้ของใหม่เลย = ค้นต่อไปก็ไม่ได้อะไร ──
+        # นี่คือ "ข้อเท็จจริง" ที่นับได้ ไม่ใช่เรื่องที่ต้องถาม LLM ว่าพอหรือยัง
+        # จากการทดลอง: LLM ไม่เคยบอก ENOUGH เลยแม้รอบ 3/4/5 จะได้ของใหม่ 0 ก้อน
+        if hop > 1 and not fresh:
+            stop_reason = f"หยุดที่รอบ {hop}: ไม่ได้ก้อนใหม่ (โค้ดตัดสิน)"
+            if verbose:
+                print(f"    ⛔ {stop_reason}")
+            break
         if hop >= max_hops:
             break
+
         queries = plan_followup(llm, question, rag.format_context(all_chunks))
+        # ── เบรกที่ 2 (โค้ดตัดสิน): LLM ขอค้นคำเดิมที่เคยค้นไปแล้ว = วนที่เดิม ──
+        queries = [q for q in queries if q not in seen_queries]
+        seen_queries.update(queries)
         if not queries:
+            stop_reason = (f"หยุดที่รอบ {hop}: "
+                           + ("LLM บอกพอแล้ว" if not seen_queries else "คำค้นซ้ำของเดิม"))
             if verbose:
-                print("    LLM บอกว่าพอแล้ว -> หยุด")
+                print(f"    ⛔ {stop_reason}")
             break
         if verbose:
             print(f"    LLM ขอค้นต่อ: {queries}")
@@ -215,7 +232,7 @@ def answer_iterative(llm, question: str, groups: list, max_hops: int = 2,
     resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
                             label="answer-iterative")
     return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(all_chunks),
-            "elapsed": round(time.perf_counter() - t0, 1)}
+            "stop_reason": stop_reason, "elapsed": round(time.perf_counter() - t0, 1)}
 
 
 # ── ให้คะแนนด้วยไม้บรรทัดเดียวกับ run_eval.py (เทียบกันได้ตรง ๆ) ──────────────
@@ -337,6 +354,7 @@ def main() -> None:
             mark = "✅" if sc["passed"] else "❌"
             print(f"    {mark} {sc['ratio']*100:.0f}%  {r['elapsed']}s  "
                   f"{len(r['hops'])} รอบ  {r['n_chunks']} ก้อน"
+                  + (f"  [{r['stop_reason']}]" if r.get("stop_reason") else "")
                   + ("" if sc["passed"] else f"  ขาด: {', '.join(sc['miss'])}"))
 
     print("\n" + "─" * 74)
