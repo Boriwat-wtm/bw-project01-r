@@ -124,11 +124,17 @@ def answer_entityhop(llm, question: str, groups: list, verbose: bool = True) -> 
 
     ents = extract_hop_entities(question, chunks)
     if ents:
-        # คำค้นรอบสอง: เอา entity ที่เพิ่งรู้ ผสมกับเจตนาของคำถามเดิม
-        qs2 = [f"{e} {question}" for e in ents] + [f"อำนาจหน้าที่ของ{e}" for e in ents[:1]]
+        # คำค้นรอบสอง: "เจาะ entity ล้วน" — จงใจไม่ผสมคำถามเดิมเข้าไป
+        # รอบแรกลองแบบ "entity + คำถามเดิมทั้งประโยค" แล้วพัง: คำถามเดิมยาวกว่ามาก
+        # จนกลบสัญญาณของ entity ผลคือดึงก้อนเดิมกลับมา (ซ้ำของที่มีแล้ว) ได้ก้อนใหม่ 1 ก้อน
+        # ของที่ยังขาดคือ "entity นี้ไปโผล่ที่ไหนอีก" ซึ่งต้องค้นด้วยตัว entity ล้วน ๆ
+        qs2 = []
+        for e in ents:
+            qs2 += [f"อำนาจหน้าที่ของ{e}", f"ให้{e}มีอำนาจ"]
         if verbose:
             print(f"    โค้ดสกัดได้: {ents} -> ค้นต่อ {len(qs2)} คำ")
-        more = rag.retrieve(qs2, rerank_query=f"{' '.join(ents)} {question}", groups=g,
+        # rerank ด้วย entity เป็นหลัก (ไม่ใช่คำถามเดิม) — รอบนี้กำลังตามหา "entity ไปโผล่ที่ไหนอีก"
+        more = rag.retrieve(qs2, rerank_query=f"อำนาจหน้าที่ของ{ents[0]}", groups=g,
                             years=y or None, versions=v or None)
         fresh = [c for c in more if c["id"] not in seen]
         for c in fresh:
