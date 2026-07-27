@@ -315,6 +315,82 @@ def answer_refshop(llm, question: str, groups: list, verbose: bool = True) -> di
             "elapsed": round(time.perf_counter() - t0, 1)}
 
 
+# ── วิธี F: "ชั้นเติมของ" — ค้นปกติเป็นพื้นเสมอ แล้วเติมข้อเท็จจริงที่คำนวณได้ทับ ──
+# แนวคิด: ไม่ต้องรู้ล่วงหน้าว่า user จะถามแบบไหน เพราะไม่ได้ "เลือกทางใดทางหนึ่ง"
+# แต่เช็คทุกกฎแล้วเติมเฉพาะที่เข้าเงื่อนไข — กฎยิงพลาดก็แค่มี context เกินนิดหน่อย
+# การค้นปกติยังทำงานอยู่เสมอ ต่างจากเส้นกราฟปัจจุบันที่ "เข้าแล้วข้ามการค้นทั้งหมด"
+# ทุกชั้นเป็น deterministic (regex + กราฟ + metadata) ไม่มี LLM ตัดสินใจ -> รันซ้ำได้ผลเดิม
+def answer_layered(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    t0 = time.perf_counter()
+    g, y, v = service.pick_groups(question, groups)
+    layers: list[str] = []          # ข้อเท็จจริงที่โค้ดคำนวณได้ เอาไปวางหัว context
+
+    # ── ชั้นพื้น: ค้น hybrid ปกติ (ทำเสมอ ไม่มีวันข้าม) ──
+    qs = rag.expand_queries(llm, question)
+    chunks = rag.retrieve(qs, rerank_query=question, groups=g,
+                          years=y or None, versions=v or None)
+    seen = {c["id"] for c in chunks}
+    hop_log = [{"hop": 1, "layer": "ค้น hybrid", "n_new": len(chunks),
+                "articles": [c.get("article", "") for c in chunks[:6]]}]
+    if verbose:
+        print(f"    [พื้น] ค้น -> {len(chunks)} ก้อน "
+              f"({', '.join(c.get('article', '') for c in chunks[:4])})")
+
+    # ── ชั้น 1: กราฟการแก้ไข (ถ้าคำถามเข้าเงื่อนไข) ──
+    art = service.detect_compare(question)
+    if art:
+        chain = rag.article_chain(art)
+        points = rag.article_timeline(art)
+        if chain:
+            layers.append(rag.format_chain(art, chain))
+        if points:
+            layers.append(f"ตัวบท 'มาตรา {art}' ทุกรุ่นที่เนื้อหาเปลี่ยนจริง "
+                          f"(พบ {len(points)} รุ่น):\n\n{rag.format_comparison(art, points)}")
+        hop_log.append({"hop": 2, "layer": "กราฟการแก้ไข", "article": art,
+                        "n_chain": len(chain), "n_points": len(points)})
+        if verbose:
+            print(f"    [+กราฟ] มาตรา {art}: สาย {len(chain)} ทอด · ตัวบท {len(points)} รุ่น")
+
+    # ── ชั้น 2: ลิงก์ refs ที่ตัวบทเขียนไว้เอง ──
+    refs = collect_refs(chunks)
+    if refs:
+        fresh = []
+        for r in refs:
+            for c in chunks_for_article(r):
+                if c["id"] not in seen:
+                    seen.add(c["id"])
+                    fresh.append(c)
+        chunks = chunks + fresh
+        hop_log.append({"hop": 3, "layer": "ลิงก์ refs", "refs": refs, "n_new": len(fresh),
+                        "articles": [c.get("article", "") for c in fresh[:6]]})
+        if verbose:
+            print(f"    [+refs] ลิงก์ มาตรา {', '.join(refs)} -> ก้อนใหม่ {len(fresh)}")
+
+    # ── ชั้น 3: สรุปฉบับแก้ไข (ของเดิมที่ระบบมีอยู่แล้ว) ──
+    amend_nos = rag.question_amendments(question)
+    if len(amend_nos) >= 2:
+        ov = rag.amendment_overlap(amend_nos)
+        if ov:
+            layers.append(ov)
+    for no in amend_nos:
+        brief = rag.amendment_brief(no)
+        if brief:
+            layers.append(brief)
+    if amend_nos and verbose:
+        print(f"    [+ฉบับ] สรุปฉบับที่ {amend_nos}")
+
+    context = rag.format_context(chunks)
+    if layers:
+        context = "\n\n".join(layers) + "\n\n" + "=" * 16 + "\n\n" + context
+    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
+            HumanMessage(content=service.build_user_prompt(question, context))]
+    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                            label="answer-layered")
+    return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(chunks),
+            "stop_reason": f"เติม {len(layers)} ชั้น (กฎในโค้ดทั้งหมด)",
+            "elapsed": round(time.perf_counter() - t0, 1)}
+
+
 # ── บังคับปิดเส้นกราฟ เพื่อวัด "ค้นอย่างเดียว" ────────────────────────────────
 class no_graph:
     """ปิด detect_compare ชั่วคราว -> answer_stream ตกไปเส้นค้นปกติเสมอ
@@ -363,6 +439,8 @@ MODES = {
           lambda llm, q, g: answer_entityhop(llm, q, g)),
     "E": ("E_refs_hop", "hop ตามลิงก์ที่ตัวบทเขียนไว้เอง (ฟิลด์ refs) — นิ่ง 100%",
           lambda llm, q, g: answer_refshop(llm, q, g)),
+    "F": ("F_layered_best", "ชั้นเติมของ: ค้นเสมอ + กราฟ + refs + สรุปฉบับ (ที่แนะนำ)",
+          lambda llm, q, g: answer_layered(llm, q, g)),
 }
 DEFAULT_MODES = ["A", "B", "C"]
 
@@ -390,6 +468,8 @@ def main() -> None:
     ap.add_argument("--mode", nargs="*", choices=list(MODES),
                     help="เลือกวิธี (ไม่ระบุ = ทำครบ A B C)")
     ap.add_argument("--q", help="ถามคำถามสด ๆ แทนการอ่านจากชุดคำถาม (ไม่มีเฉลย)")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="รันซ้ำกี่รอบต่อข้อ — ใช้วัด 'ความนิ่ง' (ผลต่างระหว่างรอบ)")
     args = ap.parse_args()
 
     if args.q:                     # ถามสด — ไม่มีเฉลย ให้คะแนนไม่ได้ ดูเส้นทางอย่างเดียว
@@ -419,30 +499,56 @@ def main() -> None:
         for m in modes:
             name = MODES[m][0]
             print(f"  ── {m}: {name}")
-            r = run_traced(m, llm, it["q"], groups)
-            sc = score(it, r["answer"])
-            results.append({**{k: it[k] for k in ("id", "level")}, **sc,
-                            "mode": m, "method": name, "elapsed": r["elapsed"],
-                            "n_chunks": r["n_chunks"], "n_hops": len(r["hops"]),
-                            "hops": r["hops"], "q": it["q"], "gold": it["gold"],
-                            "answer": r["answer"]})
-            mark = "✅" if sc["passed"] else "❌"
-            print(f"    {mark} {sc['ratio']*100:.0f}%  {r['elapsed']}s  "
-                  f"{len(r['hops'])} รอบ  {r['n_chunks']} ก้อน"
-                  + (f"  [{r['stop_reason']}]" if r.get("stop_reason") else "")
-                  + ("" if sc["passed"] else f"  ขาด: {', '.join(sc['miss'])}"))
+            for rd in range(1, args.repeat + 1):
+                r = run_traced(m, llm, it["q"], groups)
+                sc = score(it, r["answer"])
+                results.append({**{k: it[k] for k in ("id", "level")}, **sc,
+                                "mode": m, "method": name, "round": rd,
+                                "elapsed": r["elapsed"], "n_chunks": r["n_chunks"],
+                                "n_hops": len(r["hops"]), "hops": r["hops"],
+                                "q": it["q"], "gold": it["gold"], "answer": r["answer"]})
+                mark = "✅" if sc["passed"] else "❌"
+                pre = f"    รอบ {rd}: " if args.repeat > 1 else "    "
+                print(f"{pre}{mark} {sc['ratio']*100:.0f}%  {r['elapsed']}s  "
+                      f"{len(r['hops'])} รอบค้น  {r['n_chunks']} ก้อน"
+                      + (f"  [{r['stop_reason']}]" if r.get("stop_reason") else "")
+                      + ("" if sc["passed"] else f"  ขาด: {', '.join(sc['miss'])}"))
 
-    print("\n" + "─" * 74)
-    print(f"{'วิธี':<28} {'ผ่าน':<8} {'เวลาเฉลี่ย':<12} {'ก้อนเฉลี่ย'}")
+    # ── ตารางสรุป: เน้น "ความนิ่ง" เพราะนั่นคือสิ่งที่การรันซ้ำต้องการวัด ──
+    import statistics as st
+    print("\n" + "═" * 96)
+    print(f"{'วิธี':<22}{'ข้อ':<7}{'ผ่าน':<8}{'เวลา (ต่ำ-สูง)':<20}{'ก้อน (ต่ำ-สูง)':<18}{'นิ่ง?'}")
+    print("─" * 96)
+    for m in modes:
+        for iid in dict.fromkeys(r["id"] for r in results):
+            rs = [r for r in results if r["mode"] == m and r["id"] == iid]
+            if not rs:
+                continue
+            n = len(rs)
+            times = [r["elapsed"] for r in rs]
+            chks = [r["n_chunks"] for r in rs]
+            passes = [r["passed"] for r in rs]
+            # นิ่ง = ทุกรอบผ่าน/ตกเหมือนกัน และใช้ก้อนเท่ากันทุกรอบ
+            steady = len(set(passes)) == 1 and len(set(chks)) == 1
+            trange = (f"{min(times):.0f}s" if len(set(times)) == 1
+                      else f"{min(times):.0f}-{max(times):.0f}s")
+            crange = (f"{chks[0]}" if len(set(chks)) == 1
+                      else f"{min(chks)}-{max(chks)}")
+            print(f"{MODES[m][0]:<22}{iid:<7}{sum(passes)}/{n:<6}"
+                  f"{trange:<20}{crange:<18}"
+                  f"{'✅ นิ่ง' if steady else '❌ แกว่ง'}")
+    print("═" * 96)
     for m in modes:
         rs = [r for r in results if r["mode"] == m]
-        n = len(rs)
-        print(f"{MODES[m][0]:<28} {sum(r['passed'] for r in rs)}/{n:<6} "
-              f"{sum(r['elapsed'] for r in rs)/n:>6.1f}s      "
-              f"{sum(r['n_chunks'] for r in rs)/n:>5.0f}")
+        chks = [r["n_chunks"] for r in rs]
+        sd = st.stdev(chks) if len(chks) > 1 else 0.0
+        print(f"  {MODES[m][0]:<22} รวม {sum(r['passed'] for r in rs)}/{len(rs)}  "
+              f"เวลาเฉลี่ย {sum(r['elapsed'] for r in rs)/len(rs):.1f}s  "
+              f"ก้อนเฉลี่ย {sum(chks)/len(chks):.1f} (ส่วนเบี่ยงเบน ±{sd:.1f})")
 
     out = os.path.join(HERE, f"hop_compare_{time.strftime('%Y%m%d_%H%M%S')}.json")
-    json.dump({"modes": {m: MODES[m][0] for m in modes}, "results": results},
+    json.dump({"modes": {m: MODES[m][0] for m in modes}, "repeat": args.repeat,
+               "results": results},
               open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"\nผลดิบ: {os.path.relpath(out)}")
 
