@@ -225,15 +225,54 @@ def score(item: dict, answer: str) -> dict:
     return run_eval.score_item(item, answer)
 
 
+# ── บังคับปิดเส้นกราฟ เพื่อวัด "ค้นอย่างเดียว" ────────────────────────────────
+class no_graph:
+    """ปิด detect_compare ชั่วคราว -> answer_stream ตกไปเส้นค้นปกติเสมอ
+    ใช้แยกวัดว่า 'ถ้าไม่มีกราฟช่วย ระบบค้นอย่างเดียวทำได้แค่ไหน'"""
+
+    def __enter__(self):
+        self._orig = service.detect_compare
+        service.detect_compare = lambda q: ""
+        return self
+
+    def __exit__(self, *exc):
+        service.detect_compare = self._orig
+        return False
+
+
+def answer_search_only(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """แบบ A: ค้นปกติล้วน (ปิดกราฟ) — trace เดิมของระบบก่อนมีกราฟ"""
+    with no_graph():
+        r = answer_baseline(llm, question, groups, verbose=verbose)
+    return r
+
+
+def answer_graph(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """แบบ C: ปล่อยให้เส้นกราฟทำงานตามปกติ (detect_compare -> _answer_compare)
+    ถ้าคำถามไม่เข้าเงื่อนไขกราฟ จะตกไปเส้นค้นปกติเอง (บอกไว้ในผลลัพธ์)"""
+    routed = bool(service.detect_compare(question))
+    if verbose:
+        print(f"    เส้นกราฟ: {'ทำงาน (มาตรา ' + service.detect_compare(question) + ')' if routed else 'ไม่เข้าเงื่อนไข -> ตกไปเส้นค้นปกติ'}")
+    r = answer_baseline(llm, question, groups, verbose=verbose)
+    r["graph_routed"] = routed
+    return r
+
+
 # ── ทะเบียนวิธี — ชื่อในนี้คือชื่อ trace ที่จะเห็นใน MLflow ────────────────────
+MAX_HOPS = 5          # เพดานกัน LLM วนไม่จบ (ปกติมันบอก ENOUGH เองก่อนถึง)
+
 MODES = {
-    "A": ("baseline_multiquery_graph", "ระบบปัจจุบัน: แตก 4 มุม ค้นรอบเดียว + กราฟ",
-          lambda llm, q, g: answer_baseline(llm, q, g)),
-    "B": ("iterative_multihop_llm", "LLM คิดคำค้นรอบสองเอง (2 รอบ)",
-          lambda llm, q, g: answer_iterative(llm, q, g, max_hops=2)),
-    "C": ("entityhop_code", "โค้ดสกัด entity แล้วค้นรอบสองอัตโนมัติ",
+    "A": ("A_search_only", "ค้นปกติล้วน (ปิดกราฟ) = trace เดิม",
+          lambda llm, q, g: answer_search_only(llm, q, g)),
+    "B": ("B_multihop_iterative", f"Multi-hop: LLM ค้นต่อเองจนพอ (เพดาน {MAX_HOPS} รอบ)",
+          lambda llm, q, g: answer_iterative(llm, q, g, max_hops=MAX_HOPS)),
+    "C": ("C_graph_chain", "กราฟ: article_chain/timeline ดึงตรงจากกราฟการแก้ไข",
+          lambda llm, q, g: answer_graph(llm, q, g)),
+    # วิธีเสริมจากการทดลองก่อนหน้า (ไม่ได้อยู่ในชุดเทียบหลัก) — ให้โค้ดสกัด entity
+    "D": ("D_entityhop_code", "โค้ดสกัด entity แล้วค้นรอบสองอัตโนมัติ",
           lambda llm, q, g: answer_entityhop(llm, q, g)),
 }
+DEFAULT_MODES = ["A", "B", "C"]
 
 
 def run_traced(mode: str, llm, question: str, groups: list) -> dict:
@@ -258,16 +297,21 @@ def main() -> None:
     ap.add_argument("--all", action="store_true", help="ทำทั้งชุด")
     ap.add_argument("--mode", nargs="*", choices=list(MODES),
                     help="เลือกวิธี (ไม่ระบุ = ทำครบ A B C)")
+    ap.add_argument("--q", help="ถามคำถามสด ๆ แทนการอ่านจากชุดคำถาม (ไม่มีเฉลย)")
     args = ap.parse_args()
 
-    gt = json.load(open(os.path.join(EVAL_DIR, args.file), encoding="utf-8"))
-    items = gt["items"]
-    if args.id:
-        want = {x.upper() for x in args.id}
-        items = [i for i in items if i["id"] in want]
-    elif not args.all:
-        items = items[:1]
-    modes = args.mode or list(MODES)
+    if args.q:                     # ถามสด — ไม่มีเฉลย ให้คะแนนไม่ได้ ดูเส้นทางอย่างเดียว
+        items = [{"id": "ADHOC", "level": "-", "q": args.q, "gold": "(ไม่มีเฉลย)",
+                  "must": []}]
+    else:
+        gt = json.load(open(os.path.join(EVAL_DIR, args.file), encoding="utf-8"))
+        items = gt["items"]
+        if args.id:
+            want = {x.upper() for x in args.id}
+            items = [i for i in items if i["id"] in want]
+        elif not args.all:
+            items = items[:1]
+    modes = args.mode or DEFAULT_MODES
 
     rag._ensure_loaded()
     llm = rag.build_llm()
