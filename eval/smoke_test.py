@@ -156,6 +156,41 @@ def test_amendment_graph():
     check("ไม่มีมาตราไหนที่แกะชื่อฉบับก่อนหน้าไม่ออก", not unknown, f"ยังเหลือ: {unknown}")
 
 
+def test_entity_index():
+    """ดัชนีตัวละคร — ตอบคำถามแบบ 'รวบรวมให้ครบ' ที่การค้น top-k ทำไม่ได้"""
+    section("ดัชนีตัวละคร (entity index)")
+    idx = rag.entity_index()
+    check("สร้างดัชนีได้และมีครบทุก entity ที่ประกาศไว้",
+          len(idx) >= len(rag.ENTITY_PATTERNS) - 1, f"ได้ {len(idx)}/{len(rag.ENTITY_PATTERNS)}")
+    # ค่าคงที่ — ถ้าเลขนี้ขยับแปลว่าตัวบทหรือ pattern เปลี่ยน ต้องรู้ตัว
+    check("อธิบดี อยู่ใน 13 มาตรา", len(idx.get("อธิบดี", [])) == 13,
+          f"ได้ {len(idx.get('อธิบดี', []))}")
+    check("มาตราที่ต้องมีอยู่ในรายการของอธิบดี (๘ ตรี/๒๗/๕๐/๖๑)",
+          {"8 ตรี", "27", "50", "61"} <= set(idx.get("อธิบดี", [])),
+          str(idx.get("อธิบดี")))
+    # ⚠️ "รัฐมนตรี" ต้องไม่กินคำว่า "คณะรัฐมนตรี" มาเป็นของตัวเอง
+    check("แยก 'รัฐมนตรี' ออกจาก 'คณะรัฐมนตรี' ได้",
+          set(idx.get("คณะรัฐมนตรี", [])) != set(idx.get("รัฐมนตรี", []))
+          and "112" not in idx.get("รัฐมนตรี", []),
+          f"รัฐมนตรี={idx.get('รัฐมนตรี')} คณะรัฐมนตรี={idx.get('คณะรัฐมนตรี')}")
+    # รันซ้ำต้องได้ผลเดิมเป๊ะ — นี่คือเหตุผลทั้งหมดที่ใช้โค้ดนับแทน LLM สกัด
+    rag._entity_cache = None
+    check("รันซ้ำได้ผลเดิมทุกตัวอักษร (deterministic)", rag.entity_index() == idx)
+
+    check("นับจำนวนครั้งได้ ไม่ใช่แค่เจอ/ไม่เจอ",
+          rag.count_entities("ให้อธิบดีหรือผู้ซึ่งอธิบดีมอบหมาย").get("อธิบดี") == 2,
+          str(rag.count_entities("ให้อธิบดีหรือผู้ซึ่งอธิบดีมอบหมาย")))
+    check("จับ entity จากข้อความได้", "ใบจอง" in rag.question_entities("ใบจองโอนได้ไหม"))
+
+    # ⚠️ ต้องดึงตัวบทจากไฟล์ ไม่ใช่จาก _chunks — ก้อนค้นหั่นตามความยาว ไม่ได้หั่นตามมาตรา
+    #    มาตราสั้น ๆ (๕๑ ๕๔ ๙๑ ๙๘) จึงไม่มีก้อนเป็นของตัวเอง ถ้าดึงผิดทางจะได้ศูนย์
+    body = rag.entity_articles("อธิบดี")
+    missing = [a for a in ("8 ตรี", "27", "50", "51", "54", "91", "98")
+               if f"[มาตรา {a}]" not in body]
+    check("ดึงตัวบทได้ครบแม้มาตราที่ไม่มีก้อนค้นเป็นของตัวเอง", not missing,
+          f"ขาด: {missing}")
+
+
 def test_retrieval():
     """กติกาการค้นที่ห้ามพัง"""
     section("การค้นเอกสาร")
@@ -195,7 +230,8 @@ def test_no_superseded_leak():
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> int:
     for fn in (test_index_integrity, test_thai_text, test_question_intent,
-               test_amendment_graph, test_retrieval, test_no_superseded_leak):
+               test_amendment_graph, test_entity_index, test_retrieval,
+               test_no_superseded_leak):
         try:
             fn()
         except Exception as e:                       # ให้ชุดที่เหลือรันต่อได้

@@ -391,6 +391,138 @@ def answer_layered(llm, question: str, groups: list, verbose: bool = True) -> di
             "elapsed": round(time.perf_counter() - t0, 1)}
 
 
+# ── วิธี G: ชั้นเติมของ + ดัชนีตัวละคร (entity index) ─────────────────────────
+# ปัญหาที่ยังเหลือหลังทำ F: คำถามแบบ "รวบรวมให้ครบ" ยังตอบไม่ได้ (H2H1 ตก 0/3 ทุกวิธี)
+# เพราะ "อธิบดี" อยู่ใน 13 มาตรา แต่ค้นได้ทีละ 12 ก้อน — ไม่ใช่ปัญหาการ hop แต่เป็น
+# ข้อจำกัดของ top-k เอง (เรียงตามความคล้าย ไม่ใช่ความครบ) hop กี่รอบก็ไม่ครบ
+#
+# G เติมอีก 2 ชั้นบน F:
+#   ชั้น entity : เอา "รายชื่อมาตราทั้งหมดที่พูดถึง X" (โค้ดนับ) วางหัว context
+#   ชั้น pull   : ดึงตัวบทของมาตราในรายการนั้นที่ยังไม่มีในมือ เข้ามาให้ LLM อ่านจริง
+#
+# ⚠️ entity ต้องหาจาก "ก้อนที่ค้นได้" ไม่ใช่จากคำถาม — คำถามจริงมักบรรยายตัวละคร
+#    แทนที่จะเรียกชื่อ ("ผู้ที่มีอำนาจสั่งเพิกถอนโฉนด..." ไม่มีคำว่าอธิบดีสักตัว)
+#    ขั้นนี้ยังนิ่ง 100% เพราะเป็น regex บนก้อนที่ได้มา ไม่มี LLM ตัดสินใจ
+
+# ยิงเฉพาะคำถามที่ "ต้องการความครบ" — คำถามเจาะจุดเดียวไม่ต้องเติม จะได้ไม่บวม context
+_SCOPE_HINT = re.compile(r"อะไรบ้าง|ใดบ้าง|อื่นใดอีก|อื่นอีก|อีกบ้าง|ทั้งหมด|"
+                         r"มีกี่|กี่มาตรา|ครบถ้วน|ทุกมาตรา|รวบรวม")
+
+
+_POWER_HINT = re.compile(r"อำนาจ|หน้าที่|สั่ง|อนุญาต|พิจารณา|แต่งตั้ง|กำหนด|ผู้ใด")
+
+
+def pick_entities(question: str, chunks: list[dict],
+                  top_n: int = 4, max_ents: int = 2) -> list[str]:
+    """เลือก entity ที่ควรเติมรายชื่อมาตราให้ — เป็นกฎในโค้ดล้วน ไม่มี LLM ตัดสิน
+
+    ⚠️ ห้ามดูแค่คำถาม: คำถามจริงมักบรรยายตัวละครแทนที่จะเรียกชื่อ
+       "ผู้ที่มีอำนาจสั่งเพิกถอนโฉนดที่ดิน..." -> จับได้แต่ "โฉนดที่ดิน" ซึ่งเป็นกรรม
+       ไม่ใช่ประธาน ต้องดูตัวบทที่ค้นได้ด้วยถึงจะรู้ว่าประธานคือ "อธิบดี"
+
+    ⚠️ และห้ามนับแค่ 'เจอ/ไม่เจอ': มาตราเดียวเอ่ยถึงหลายตัว ต้องนับจำนวนครั้ง
+       ตัวที่เป็นประธานของมาตราจะถูกเอ่ยซ้ำมากกว่าตัวประกอบ
+    """
+    from collections import Counter
+    cnt: "Counter[str]" = Counter()
+    for c in chunks[:top_n]:                       # ดูเฉพาะก้อนอันดับต้น — ก้อนท้ายมักหลุดประเด็น
+        for name, n in rag.count_entities(c.get("text", "")).items():
+            cnt[name] += n
+    for name in rag.question_entities(question):   # ที่คำถามเรียกชื่อมาตรง ๆ ให้แต้มพิเศษ
+        cnt[name] += 2
+    cand = [n for n, _ in cnt.most_common()]
+    # คำถามแนว "มีอำนาจ/หน้าที่อะไรบ้าง" -> ต้องเป็นผู้กระทำ ไม่ใช่ชื่อเอกสาร
+    if _POWER_HINT.search(question or ""):
+        actors = [n for n in cand if n in rag.ENTITY_ACTORS]
+        if actors:
+            cand = actors
+    return cand[:max_ents]
+
+
+def answer_entity_index(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี G: F + ดัชนีตัวละคร — ทุกชั้นเป็นโค้ดล้วน ไม่มี LLM ตัดสินใจว่าจะไปไหนต่อ"""
+    t0 = time.perf_counter()
+    g, y, v = service.pick_groups(question, groups)
+    layers: list[str] = []
+
+    # ── ชั้นพื้น: ค้น hybrid ปกติ (ทำเสมอ) ──
+    qs = rag.expand_queries(llm, question)
+    chunks = rag.retrieve(qs, rerank_query=question, groups=g,
+                          years=y or None, versions=v or None)
+    seen = {c["id"] for c in chunks}
+    hop_log = [{"hop": 1, "layer": "ค้น hybrid", "n_new": len(chunks),
+                "articles": [c.get("article", "") for c in chunks[:6]]}]
+    if verbose:
+        print(f"    [พื้น] ค้น -> {len(chunks)} ก้อน "
+              f"({', '.join(c.get('article', '') for c in chunks[:4])})")
+
+    # ── ชั้น 1: กราฟการแก้ไข ──
+    art = service.detect_compare(question)
+    if art:
+        chain, points = rag.article_chain(art), rag.article_timeline(art)
+        if chain:
+            layers.append(rag.format_chain(art, chain))
+        if points:
+            layers.append(f"ตัวบท 'มาตรา {art}' ทุกรุ่นที่เนื้อหาเปลี่ยนจริง "
+                          f"(พบ {len(points)} รุ่น):\n\n{rag.format_comparison(art, points)}")
+        hop_log.append({"hop": 2, "layer": "กราฟการแก้ไข", "article": art})
+        if verbose:
+            print(f"    [+กราฟ] มาตรา {art}: สาย {len(chain)} ทอด · ตัวบท {len(points)} รุ่น")
+
+    # ── ชั้น 2: ดัชนีตัวละคร (ของใหม่) ──
+    ents, pulled_arts = [], []
+    if _SCOPE_HINT.search(question):
+        ents = pick_entities(question, chunks)
+        for name in ents:
+            brief = rag.entity_brief(name)          # รายชื่อมาตรา (บอกว่ามีอะไรบ้าง)
+            if brief:
+                layers.append(brief)
+            body = rag.entity_articles(name)        # ตัวบทจริงของมาตราเหล่านั้น
+            if body:
+                layers.append(body)
+                pulled_arts += rag.entity_index().get(name, [])
+        hop_log.append({"hop": 3, "layer": "ดัชนีตัวละคร", "entities": ents,
+                        "n_new": len(pulled_arts), "articles": pulled_arts})
+        if verbose:
+            print(f"    [+ตัวละคร] {', '.join(ents) or '-'} "
+                  f"-> เติมตัวบท {len(pulled_arts)} มาตรา ({', '.join(pulled_arts[:8])}...)")
+    elif verbose:
+        print("    [+ตัวละคร] คำถามไม่ได้ถามแบบ 'ครบถ้วน' -> ไม่เติม")
+
+    # ── ชั้น 3: ลิงก์ refs ──
+    refs = collect_refs(chunks)
+    if refs:
+        fresh = [c for r in refs for c in chunks_for_article(r) if c["id"] not in seen]
+        for c in fresh:
+            seen.add(c["id"])
+        chunks = chunks + fresh
+        hop_log.append({"hop": 4, "layer": "ลิงก์ refs", "refs": refs, "n_new": len(fresh)})
+        if verbose:
+            print(f"    [+refs] ลิงก์ มาตรา {', '.join(refs)} -> ก้อนใหม่ {len(fresh)}")
+
+    # ── ชั้น 4: สรุปฉบับแก้ไข ──
+    amend_nos = rag.question_amendments(question)
+    if len(amend_nos) >= 2:
+        ov = rag.amendment_overlap(amend_nos)
+        if ov:
+            layers.append(ov)
+    for no in amend_nos:
+        brief = rag.amendment_brief(no)
+        if brief:
+            layers.append(brief)
+
+    context = rag.format_context(chunks)
+    if layers:
+        context = "\n\n".join(layers) + "\n\n" + "=" * 16 + "\n\n" + context
+    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
+            HumanMessage(content=service.build_user_prompt(question, context))]
+    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                            label="answer-entity-index")
+    return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(chunks),
+            "stop_reason": f"เติม {len(layers)} ชั้น · ตัวละคร {ents or '-'} (กฎในโค้ดทั้งหมด)",
+            "elapsed": round(time.perf_counter() - t0, 1)}
+
+
 # ── บังคับปิดเส้นกราฟ เพื่อวัด "ค้นอย่างเดียว" ────────────────────────────────
 class no_graph:
     """ปิด detect_compare ชั่วคราว -> answer_stream ตกไปเส้นค้นปกติเสมอ
@@ -441,6 +573,8 @@ MODES = {
           lambda llm, q, g: answer_refshop(llm, q, g)),
     "F": ("F_layered_best", "ชั้นเติมของ: ค้นเสมอ + กราฟ + refs + สรุปฉบับ (ที่แนะนำ)",
           lambda llm, q, g: answer_layered(llm, q, g)),
+    "G": ("G_entity_index", "F + ดัชนีตัวละคร (โค้ดนับว่า X อยู่มาตราใดบ้าง) — แก้คำถามแบบ 'รวบรวมให้ครบ'",
+          lambda llm, q, g: answer_entity_index(llm, q, g)),
 }
 DEFAULT_MODES = ["A", "B", "C"]
 
