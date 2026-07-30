@@ -470,8 +470,13 @@ def answer_entity_index(llm, question: str, groups: list, verbose: bool = True) 
             print(f"    [+กราฟ] มาตรา {art}: สาย {len(chain)} ทอด · ตัวบท {len(points)} รุ่น")
 
     # ── ชั้น 2: ดัชนีตัวละคร (ของใหม่) ──
+    # ⚠️ ต้องยอมถอยให้ชั้นที่เจาะจงกว่า: "ฉบับใดบ้าง / มาตราใดบ้าง" ก็ติด _SCOPE_HINT
+    #    เหมือนกัน แต่เป็นคำถามเรื่อง "การแก้ไข" ไม่ใช่เรื่อง "ตัวละคร" ถ้าปล่อยให้ยิง
+    #    จะเอาตัวบท 24 มาตราไปกลบสายการแก้ไขที่กราฟเตรียมไว้ให้แล้ว
+    #    วัดจริงแล้วทำ H1 กับ H10 ที่เคยผ่านพัง -> กติกา: ชั้นเจาะจงมาก่อนชั้นกว้างเสมอ
+    specific_layer = bool(art) or bool(rag.question_amendments(question))
     ents, pulled_arts = [], []
-    if _SCOPE_HINT.search(question):
+    if _SCOPE_HINT.search(question) and not specific_layer:
         ents = pick_entities(question, chunks)
         for name in ents:
             brief = rag.entity_brief(name)          # รายชื่อมาตรา (บอกว่ามีอะไรบ้าง)
@@ -487,7 +492,8 @@ def answer_entity_index(llm, question: str, groups: list, verbose: bool = True) 
             print(f"    [+ตัวละคร] {', '.join(ents) or '-'} "
                   f"-> เติมตัวบท {len(pulled_arts)} มาตรา ({', '.join(pulled_arts[:8])}...)")
     elif verbose:
-        print("    [+ตัวละคร] คำถามไม่ได้ถามแบบ 'ครบถ้วน' -> ไม่เติม")
+        print(f"    [+ตัวละคร] ไม่เติม "
+              f"({'มีชั้นเจาะจงกว่าทำงานอยู่แล้ว' if specific_layer else 'ไม่ได้ถามแบบครบถ้วน'})")
 
     # ── ชั้น 3: ลิงก์ refs ──
     refs = collect_refs(chunks)
