@@ -164,6 +164,8 @@ PDF ──PyMuPDF──> chunk ตามขอบ "มาตรา/ข้อ" �
   หลุดตำแหน่ง (`"ทรพั ยส์ นิ"` แทน `"ทรัพย์สิน"`) พังทั้ง embedding, BM25 และตัวบทที่ LLM คัดไปตอบ
 - **เลขไทย ๐-๙** ถูก normalize เป็นอารบิกตอน tokenize → ถาม "มาตรา 9" เจอ "มาตรา ๙"
 - เปลี่ยน `CHUNK_SIZE` / `EMBED_MODEL` ต้อง rebuild: `python -c "import rag; rag.build_vectorstore(force=True)"`
+- เปลี่ยนแค่ **วิธีคำนวณ metadata** (ไม่ได้แตะตัวข้อความ) ไม่ต้อง embed ใหม่ทั้งชุด —
+  `python -c "import rag; rag.refresh_metadata()"` อัปเดตเฉพาะ metadata ใน Chroma (เร็วกว่ามาก)
 - reranker ใช้ GPU ตัวเดียว → FastAPI ต้องรัน **worker เดียว** (อย่าใช้ `--workers >1`)
 
 ## metadata ที่เก็บต่อ chunk
@@ -285,7 +287,8 @@ _บทเรียน: อย่าเชื่อตัวชี้วัด�
 
 **3. เพิ่ม iterative multi-hop?** (`experiments/multihop_iterative.py`, `eval/multihop.json`)
 เขียนชุดคำถาม "ต้อง hop จริง" 8 ข้อขึ้นมาก่อน เพราะชุดวัดเดิม 112 ข้อ (4 ชุดแรก) ไม่มีคำถามประเภทนี้เลย —
-พอวัดแล้ว**พบช่องว่างจริง** จึงลองทำ 5 วิธีแล้วรันคำถามละ 3 รอบเพื่อวัด "ความนิ่ง":
+พอวัดแล้ว**พบช่องว่างจริง** จึงลองทำ 7 วิธี (A-G ใน `experiments/multihop_iterative.py`)
+แล้วรันคำถามละ 3 รอบเพื่อวัด "ความนิ่ง":
 
 | วิธี | ข้อ | ผ่าน | เวลา | ก้อน | นิ่ง? |
 |---|---|---|---|---|---|

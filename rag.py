@@ -661,23 +661,6 @@ def load_pdf_chunks() -> list[dict]:
 
 
 # ── vector store + BM25 ───────────────────────────────────────────────────────
-def embed_tag() -> str:
-    """tag สั้นจาก EMBED_MODEL สำหรับตั้งชื่อไฟล์/MLflow run (กันทับข้าม embedding)
-    ada-002 -> 'ada' | paraphrase-multilingual -> 'para' | qwen/qwen3-8b -> 'q3-8b'"""
-    m = EMBED_MODEL.lower()
-    if "ada" in m:
-        return "ada"
-    if "paraphrase" in m:
-        return "para"
-    if "qwen3-8b" in m:
-        return "q3-8b"
-    if "3-large" in m:
-        return "3-large"
-    if "3-small" in m:
-        return "3-small"
-    return re.sub(r"[^a-z0-9]+", "-", m).strip("-")[:12] or "emb"
-
-
 def _init_embeddings():
     global _embeddings
     if _embeddings is None:
@@ -1145,11 +1128,6 @@ _LAYOUT_NOISE_RE = re.compile(r"\[\d+\]|\|\s*\d+")
 def law_text_norm(body: str) -> str:
     """ตัวบทล้วน ๆ — ตัดเลขหน้า/เชิงอรรถ/ช่องว่างทิ้ง เหลือเฉพาะตัวอักษรที่เป็นเนื้อกฎหมาย"""
     return re.sub(r"\s+", "", _LAYOUT_NOISE_RE.sub(" ", body or ""))
-
-
-def law_text_key(body: str) -> str:
-    """ลายนิ้วมือของตัวบท (ใช้เทียบแบบเป๊ะ)"""
-    return text_key(_LAYOUT_NOISE_RE.sub(" ", body or ""))
 
 
 # เทียบเป๊ะเข้มเกินไป: PDF ฉบับต่างกันมีเศษที่ไม่ใช่ตัวบทหลุดมาไม่เหมือนกัน
@@ -1717,15 +1695,6 @@ COMPARE_SYSTEM = (
 )
 
 
-# คำสั่งให้ LLM ขยายคำถาม (Thai/English) -> คีย์เวิร์ดอังกฤษ + ศัพท์เทคนิคที่กฎใช้จริง
-# แก้ปัญหา vocab mismatch (เช่น 'ที่ดินหลวง'↔'สาธารณสมบัติของแผ่นดิน', 'บุกรุก'↔'เข้าไปยึดถือครอบครอง')
-EXPAND_SYSTEM = (
-    "คุณเป็นตัวช่วยขยายคำค้นสำหรับค้นเอกสารกฎหมายไทย จากคำถาม (ไทย/อังกฤษ) "
-    "ให้ output เป็นบรรทัดเดียวของคำค้น/ศัพท์กฎหมายไทย 6-15 คำ ที่น่าจะปรากฏในตัวบทจริง "
-    "(คำพ้อง คำที่กฎหมายใช้ เลขมาตรา ชื่อพระราชบัญญัติ) ไม่ต้องอธิบาย ไม่ต้องมีเครื่องหมายคำพูด — คำค้นบรรทัดเดียว"
-)
-
-
 # Multi-query (RAG-Fusion): แตก 1 คำถาม -> 3 มุมค้นหา ทำใน LLM call เดียว
 # แต่ละบรรทัด = คีย์เวิร์ดคนละมุม จะถูกเอาไปต่อท้ายคำถามเดิม (คงพิกัด/ตัวเลขเดิมไว้ทุกอัน)
 EXPAND_MULTI_SYSTEM = (
@@ -1778,7 +1747,6 @@ DOMAINS = {
         "section_fmt": _th_label,
         "year_re": _YEAR_RE,                 # 25xx (พ.ศ.) / 20xx
         "system_prompt": SYSTEM_PROMPT,       # ไทย (ดูด้านบน)
-        "expand_system": EXPAND_SYSTEM,
         "expand_multi_system": EXPAND_MULTI_SYSTEM,
         "user_intro": "เอกสารอ้างอิง (กฎหมายไทย จากราชกิจจานุเบกษา):",
     },
@@ -1841,11 +1809,6 @@ def track_usage(resp: Any) -> None:
         _token_usage["calls"] += 1
     except Exception:
         pass
-
-
-def reset_usage() -> None:
-    for k in _token_usage:
-        _token_usage[k] = 0
 
 
 # ── invoke + retry (กัน endpoint ส่ง response หล่นกลางคัน) ────────────────────────
@@ -1944,21 +1907,6 @@ def invoke_retry(llm: Any, messages: "list[Any]", ok_fn: "Optional[Callable[[str
             print(f"    [retry {label}] attempt {attempt+1}: output ผิดปกติ "
                   f"({len(content)} ตัว) — ลองใหม่")
     return last
-
-
-def expand_query(llm: Any, question: str) -> str:
-    """ขยายคำถามด้วย LLM เป็นคีย์เวิร์ดอังกฤษ+ศัพท์เทคนิค แล้วต่อท้ายคำถามเดิม
-    (คงคำถามเดิมไว้เพื่อรักษาโค้ด/พิกัดที่พิมพ์มาตรง ๆ เช่น Y=535)
-    หมายเหตุ: single-query เดิม — ยังใช้โดย speed_test.py / experiment_buckets.py"""
-    try:
-        r = llm.invoke([SystemMessage(content=EXPAND_SYSTEM), HumanMessage(content=question)])
-        track_usage(r)
-        kw = " ".join(str(r.content).split())
-        if kw:
-            return f"{question} {kw}"
-    except Exception:
-        pass
-    return question
 
 
 @traced("LLM")
