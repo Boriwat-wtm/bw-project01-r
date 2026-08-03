@@ -439,8 +439,12 @@ def pick_entities(question: str, chunks: list[dict],
     return cand[:max_ents]
 
 
-def answer_entity_index(llm, question: str, groups: list, verbose: bool = True) -> dict:
-    """วิธี G: F + ดัชนีตัวละคร — ทุกชั้นเป็นโค้ดล้วน ไม่มี LLM ตัดสินใจว่าจะไปไหนต่อ"""
+def answer_entity_index(llm, question: str, groups: list, verbose: bool = True,
+                        _compose: bool = True) -> dict:
+    """วิธี G: F + ดัชนีตัวละคร — ทุกชั้นเป็นโค้ดล้วน ไม่มี LLM ตัดสินใจว่าจะไปไหนต่อ
+
+    _compose=False -> คืน context ที่ประกอบเสร็จแล้วโดยยังไม่เรียบเรียง
+    ให้วิธี H เอาไปทำขั้นสกัด JSON ต่อ (จะได้ไม่ต้องก๊อปชั้นทั้งหมดมาเขียนซ้ำ)"""
     t0 = time.perf_counter()
     g, y, v = service.pick_groups(question, groups)
     layers: list[str] = []
@@ -520,12 +524,156 @@ def answer_entity_index(llm, question: str, groups: list, verbose: bool = True) 
     context = rag.format_context(chunks)
     if layers:
         context = "\n\n".join(layers) + "\n\n" + "=" * 16 + "\n\n" + context
-    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
-            HumanMessage(content=service.build_user_prompt(question, context))]
-    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
-                            label="answer-entity-index")
-    return {"answer": str(resp.content), "hops": hop_log, "n_chunks": len(chunks),
+
+    def _compose_now() -> dict:
+        msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"]),
+                HumanMessage(content=service.build_user_prompt(question, context))]
+        r = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                             label="answer-entity-index")
+        return {"answer": str(r.content), "n_chunks": len(chunks)}
+
+    if not _compose:
+        return {"context": context, "ents": ents, "hops": hop_log,
+                "n_chunks": len(chunks), "compose": _compose_now}
+
+    return {**_compose_now(), "hops": hop_log,
             "stop_reason": f"เติม {len(layers)} ชั้น · ตัวละคร {ents or '-'} (กฎในโค้ดทั้งหมด)",
+            "elapsed": round(time.perf_counter() - t0, 1)}
+
+
+# ── วิธี H: G + บังคับให้ตอบเป็นโครงสร้างก่อน แล้วให้โค้ดตรวจว่าครบไหม ──────────
+# ที่มา: วัดแล้วพบว่าคอขวดที่เหลือไม่ใช่การค้น แต่เป็นการเรียบเรียงคำตอบ
+# (context เหมือนกันเป๊ะทั้ง 3 รอบ แต่ผลต่างกัน) และการเติม "กฎเป็นข้อความ" ใน prompt
+# ก็พิสูจน์แล้วว่าไม่ช่วย (2/3 -> 2/3) จึงลองเปลี่ยนจาก "ขอ" เป็น "บังคับ":
+#
+#   ขั้น 1  ให้ LLM สกัดเป็น JSON (endpoint รองรับ response_format — เช็คแล้ว)
+#   ขั้น 2  โค้ดเทียบกับ entity_index ว่าขาดมาตราไหนไป ถ้าขาดให้ขอใหม่พร้อมชี้ตัวที่ขาด
+#   ขั้น 3  ให้ LLM เรียบเรียงจากโครงที่ตรวจแล้ว (ห้ามตัดทิ้ง)
+#
+# ⚠️ ขั้น 2 เป็นหัวใจ — ไม่ได้เชื่อว่า endpoint บังคับ schema ให้จริง แต่ให้โค้ดนับเอง
+#    ซึ่งทำได้เพราะ entity_index บอกอยู่แล้วว่า "คำตอบเต็มคือมาตราอะไรบ้าง"
+_EXTRACT_SYS = (
+    "คุณเป็นผู้ช่วยสกัดข้อเท็จจริงจากตัวบทกฎหมายไทย ตอบเป็น JSON เท่านั้น\n"
+    "- ไล่ให้ครบทุกมาตราที่ปรากฏใน 'รายการมาตราที่ต้องครอบคลุม'\n"
+    "- ห้ามข้ามมาตราใด ถ้ามาตราไหนไม่มีเนื้อหาที่เกี่ยวกับคำถาม ให้ใส่ \"-\" ในช่อง เรื่อง\n"
+    "- ช่อง มาตรา ให้คัดเลขมาตราตามที่ปรากฏจริง ห้ามแก้ ห้ามเดา"
+)
+# ⚠️ ใช้ json_object ไม่ใช่ json_schema — เพราะ langchain แปลง json_schema ไปเรียก
+#    endpoint /chat/completions/parse ซึ่ง endpoint นี้ไม่มี แล้วพังเป็น APIConnectionError
+#    (วัดแล้ว: prompt สั้น ๆ ก็พัง ไม่ใช่เรื่องขนาด) json_object ใช้เส้นทางปกติ ทำงานได้
+_EXTRACT_SHAPE = ('{"ประธาน": "...", '
+                  '"รายการ": [{"มาตรา": "...", "เรื่อง": "..."}]}')
+
+
+def _norm_art(s: str) -> str:
+    """เทียบเลขมาตราให้ตรงกัน — โมเดลตอบเลขไทย (๒๗) แต่ดัชนีเก็บเลขอารบิก (27)"""
+    return " ".join(str(s or "").translate(rag.THAI_DIGITS).replace("มาตรา", "").split())
+
+
+def _extract_json(llm, question: str, context: str, must_arts: list[str],
+                  hint: str = "") -> dict:
+    """ยิง LLM ขอผลเป็น JSON — คืน dict ว่าง ๆ ถ้า parse ไม่ได้ (ไม่ให้ทั้งรอบพัง)"""
+    body = (f"{context}\n\n{'=' * 16}\n\nคำถาม: {question}\n\n"
+            f"รายการมาตราที่ต้องครอบคลุม ({len(must_arts)} มาตรา): {', '.join(must_arts)}\n"
+            f"ตอบเป็น JSON รูปแบบ {_EXTRACT_SHAPE}\n{hint}")
+    try:
+        bound = llm.bind(response_format={"type": "json_object"})
+        r = bound.invoke([SystemMessage(content=_EXTRACT_SYS), HumanMessage(content=body)])
+        rag.track_usage(r)
+        txt = str(r.content).strip()
+        # เผื่อ endpoint ห่อด้วย ```json แม้จะสั่ง response_format ไปแล้ว
+        if txt.startswith("```"):
+            txt = txt.strip("`").split("\n", 1)[-1].rsplit("```", 1)[0]
+        return json.loads(txt)
+    except Exception:
+        return {}
+
+
+def answer_json_structured(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี H: เหมือน G ทุกชั้น แต่เพิ่มขั้นสกัด JSON + ให้โค้ดตรวจความครบก่อนเรียบเรียง"""
+    t0 = time.perf_counter()
+    base = answer_entity_index(llm, question, groups, verbose=verbose, _compose=False)
+    context, ents, hop_log = base["context"], base["ents"], base["hops"]
+
+    # ถ้าชั้นตัวละครไม่ยิง ก็ไม่มี "รายการที่ต้องครอบคลุม" ให้ตรวจ -> ตอบแบบ G ตามปกติ
+    # ⚠️ ต้องตัดมาตราซ้ำออกก่อน — ตัวละคร 2 ตัวมีมาตราทับกันได้ (ม.๕๗ ม.๖๑ อยู่ทั้ง
+    #    "อธิบดี" และ "เจ้าพนักงานที่ดิน") ถ้าไม่ตัด ตัวหารจะเกินจริงแล้วรายงานว่า
+    #    "ได้ 22/24 ครบ" ซึ่งอ่านแล้วขัดกันเอง
+    must_arts = list(dict.fromkeys(a for n in ents
+                                   for a in rag.entity_index().get(n, [])))
+    if not must_arts:
+        if verbose:
+            print("    [JSON] ไม่มีรายการให้ตรวจความครบ -> ตอบแบบปกติ")
+        return {**base["compose"](), "hops": hop_log,
+                "stop_reason": "ไม่เข้าเงื่อนไขขั้นสกัด JSON",
+                "elapsed": round(time.perf_counter() - t0, 1)}
+
+    # ── ขั้น 1: สกัดเป็น JSON ──
+    data = _extract_json(llm, question, context, must_arts)
+    got = {_norm_art(x.get("มาตรา")) for x in (data.get("รายการ") or [])}
+    missing = [a for a in must_arts if _norm_art(a) not in got]
+    if verbose:
+        print(f"    [JSON] รอบ 1: ได้ {len(got)}/{len(must_arts)} มาตรา"
+              f"{' · ขาด ' + ', '.join(missing) if missing else ' ครบ'}")
+
+    # ── ขั้น 2: โค้ดตรวจแล้วขอใหม่ถ้าขาด (ขอครั้งเดียว กันวนไม่จบ) ──
+    retried = False
+    if missing:
+        retried = True
+        hint = (f"\n⚠️ รอบก่อนคุณข้ามมาตราเหล่านี้ไป: {', '.join(missing)}\n"
+                f"คราวนี้ต้องมีครบทุกมาตราในรายการ ห้ามข้าม")
+        data2 = _extract_json(llm, question, context, must_arts, hint)
+        got2 = {_norm_art(x.get("มาตรา")) for x in (data2.get("รายการ") or [])}
+        if len(got2) > len(got):
+            data, got = data2, got2
+            missing = [a for a in must_arts if _norm_art(a) not in got]
+        if verbose:
+            print(f"    [JSON] รอบ 2: ได้ {len(got)}/{len(must_arts)} มาตรา"
+                  f"{' · ยังขาด ' + ', '.join(missing) if missing else ' ครบ'}")
+
+    hop_log.append({"hop": 5, "layer": "สกัด JSON + ตรวจความครบ",
+                    "must": len(must_arts), "got": len(got),
+                    "missing": missing, "retried": retried})
+
+    # ── ขั้น 3: เรียบเรียงจากโครงที่ตรวจแล้ว ──
+    outline = "\n".join(f"  - มาตรา {x.get('มาตรา')}: {x.get('เรื่อง')}"
+                        for x in (data.get("รายการ") or [])
+                        if str(x.get("เรื่อง", "")).strip() not in ("", "-"))
+    compose_ctx = (
+        f"ข้อเท็จจริงที่สกัดและตรวจความครบด้วยโค้ดแล้ว "
+        f"(ประธาน: {data.get('ประธาน', '-')}):\n{outline}\n\n"
+        f"{'=' * 16}\n\n{context}")
+    msgs = [SystemMessage(content=rag.DOMAINS["thai_law"]["system_prompt"] +
+                          "\n- ⚠️ ต้องกล่าวถึงทุกรายการในบล็อก 'ข้อเท็จจริงที่สกัดแล้ว' "
+                          "ให้ครบ ห้ามตัดทิ้ง ห้ามสรุปรวบ"),
+            HumanMessage(content=service.build_user_prompt(question, compose_ctx))]
+    resp = rag.invoke_retry(llm, msgs, ok_fn=lambda c: not rag.looks_truncated(c),
+                            label="answer-json-structured")
+    answer = str(resp.content)
+
+    # ── ขั้น 4: โค้ดเช็คว่าคำตอบที่เรียบเรียงออกมา "ตกหล่น" ไปไหม ──
+    # วัดแล้วพบว่าถึงจะส่งโครงที่ครบให้ และสั่งห้ามตัดทิ้ง LLM ก็ยังตัดอยู่ดีบางรอบ
+    # (รอบที่ตกใช้เวลา 30s ส่วนรอบที่ผ่าน 70-78s = มันเขียนสั้นลงแล้วข้ามของ)
+    # จึงให้โค้ดต่อท้ายรายการที่หายไปเอง — ข้อเท็จจริงส่วนนี้ตรวจแล้วว่ามาจากตัวบทจริง
+    # ตรงหลักการเดิม: ข้อเท็จจริงให้โค้ดคุม การเรียบเรียงให้ LLM
+    items = [x for x in (data.get("รายการ") or [])
+             if str(x.get("เรื่อง", "")).strip() not in ("", "-")]
+    dropped = [x for x in items if f"มาตรา {_norm_art(x.get('มาตรา'))}" not in
+               " ".join(answer.translate(rag.THAI_DIGITS).split())]
+    if dropped:
+        answer += ("\n\n**รายการที่เหลือ (โค้ดตรวจจากตัวบทแล้ว):**\n" +
+                   "\n".join(f"- มาตรา {_norm_art(x.get('มาตรา'))}: {x.get('เรื่อง')}"
+                             for x in dropped))
+    if verbose:
+        print(f"    [ตรวจคำตอบ] เรียบเรียงแล้วตกหล่น {len(dropped)}/{len(items)} รายการ"
+              f"{' -> โค้ดเติมกลับให้' if dropped else ''}")
+    hop_log.append({"hop": 6, "layer": "ตรวจคำตอบที่เรียบเรียง",
+                    "items": len(items), "dropped": len(dropped)})
+
+    return {"answer": answer, "hops": hop_log, "n_chunks": base["n_chunks"],
+            "stop_reason": (f"สกัด {len(got)}/{len(must_arts)} มาตรา"
+                            f"{' (ขอใหม่ 1 รอบ)' if retried else ''}"
+                            f"{' · ยังขาด ' + ','.join(missing) if missing else ''}"),
             "elapsed": round(time.perf_counter() - t0, 1)}
 
 
@@ -581,6 +729,8 @@ MODES = {
           lambda llm, q, g: answer_layered(llm, q, g)),
     "G": ("G_entity_index", "F + ดัชนีตัวละคร (โค้ดนับว่า X อยู่มาตราใดบ้าง) — แก้คำถามแบบ 'รวบรวมให้ครบ'",
           lambda llm, q, g: answer_entity_index(llm, q, g)),
+    "H": ("H_json_structured", "G + บังคับสกัดเป็น JSON แล้วให้โค้ดตรวจความครบก่อนเรียบเรียง",
+          lambda llm, q, g: answer_json_structured(llm, q, g)),
 }
 DEFAULT_MODES = ["A", "B", "C"]
 
