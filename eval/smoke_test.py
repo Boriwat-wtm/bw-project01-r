@@ -208,6 +208,56 @@ def test_retrieval():
     check("chunk จาก OCR ต้องไม่ติดอันดับต้น ๆ", not any(c.get("is_scan") for c in cs[:3]))
 
     check("ถามมาตราที่ไม่มีจริง ต้องไม่คืนอะไรมั่ว", rag.article_timeline("999") == [])
+
+    # ── embedding ล่ม ต้องไม่ทำให้ค้นไม่ได้เลย (BM25 คำนวณในเครื่อง ไม่ต้องต่อเน็ต) ──
+    # เคยเกิดจริง: โควตา embedding หมด แล้วเส้นค้นตายทั้งเส้นทั้งที่ BM25 ยังใช้ได้
+    #
+    # ⚠️ ข้อนี้ดักความพลาดที่เคยเกิดจริงตอนเขียนฟีเจอร์นี้: ตอนแรกดัก error ด้วย
+    #    (ConnectionError, TimeoutError, OSError) แล้วเทสผ่าน เพราะเทสจำลองด้วย
+    #    ConnectionError — แต่ error จริงจาก endpoint สืบทอดจาก openai.OpenAIError
+    #    ไม่ใช่ ConnectionError เลย ผลคือของจริงจะไม่ถูกดัก แล้วระบบพังเหมือนเดิม
+    #    เทสข้างล่างเช็คกับคลาส error ตัวจริง ไม่ใช่ตัวที่เราจำลองขึ้นเอง
+    try:
+        import openai
+        real_errs = ["APIConnectionError", "APITimeoutError",
+                     "RateLimitError", "AuthenticationError"]
+        uncaught = [n for n in real_errs
+                    if not issubclass(getattr(openai, n), rag.SEMANTIC_DOWN)]
+        check("error จริงจาก endpoint ต้องถูกดักครบทุกตัว", not uncaught,
+              f"ดักไม่ได้: {uncaught}")
+    except ImportError:
+        pass
+
+    class _DeadEmbed:
+        def embed_query(self, _q):
+            raise ConnectionError("simulated")
+
+    _orig_embed = rag._embeddings
+    rag._embeddings = _DeadEmbed()
+    try:
+        stages: list = []
+        st: dict = {}
+        cs = rag.retrieve("ที่ดินที่ออกใบจองห้ามโอนภายในกี่ปี",
+                          groups=[rag.GROUP_IN_FORCE], on_stage=stages.append, stats=st)
+        check("embedding ล่ม -> ยังค้นได้ด้วย BM25", len(cs) > 0, f"ได้ {len(cs)} ก้อน")
+        check("embedding ล่ม -> ยังเจอมาตราที่มีคำตอบ",
+              any(rag.head_article_num(c.get("article", "")) in ("31", "33") for c in cs),
+              str([c.get("article") for c in cs[:5]]))
+        check("embedding ล่ม -> รายงานโหมด bm25_only กลับมา",
+              st.get("mode") == "bm25_only", str(st))
+        # ⚠️ ข้อนี้สำคัญที่สุด — ลดคุณภาพแบบเงียบ ๆ คือบั๊กที่อยู่ได้นานที่สุด
+        check("embedding ล่ม -> ต้องแจ้งเตือนออกมา ไม่เงียบ",
+              any("⚠️" in s for s in stages), f"stages={stages[-2:]}")
+    finally:
+        rag._embeddings = _orig_embed
+    st2: dict = {}
+    rag.retrieve("มาตรา ๙", groups=[rag.GROUP_IN_FORCE], stats=st2)
+    check("endpoint กลับมาปกติ -> โหมดกลับเป็น hybrid", st2.get("mode") == "hybrid", str(st2))
+    # ⚠️ โหมดต้องเป็นของ "แต่ละคำถาม" ไม่ใช่ตัวแปรกลาง — ไม่งั้นคำถามที่ปกติจะไปทับ
+    #    ค่าของคำถามที่ล่ม แล้วคนนั้นจะไม่ได้รับคำเตือน (FastAPI รับหลายคำถามพร้อมกันได้)
+    check("โหมดแยกกันต่อคำถาม ไม่ปนกัน",
+          st.get("mode") == "bm25_only" and st2.get("mode") == "hybrid",
+          f"{st} / {st2}")
     brief = rag.amendment_brief(4)
     check("สรุป พ.ร.บ.แก้ไข ดึงได้ครบ (วันมีผลบังคับ + มาตราที่แก้)",
           "วันมีผลบังคับ" in brief and "มาตรา 31" in brief)

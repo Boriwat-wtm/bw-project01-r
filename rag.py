@@ -983,13 +983,28 @@ def version_at_year(year: int) -> int:
     return best_v
 
 
+# error ที่ถือว่า "ฝั่ง semantic ใช้ไม่ได้ชั่วคราว" แล้วให้ตกไปใช้ BM25 อย่างเดียว
+# ⚠️ จงใจไม่ดัก Exception กว้าง ๆ — ถ้าดักหมด บั๊กในโค้ดเราเอง (พิมพ์ชื่อตัวแปรผิด ฯลฯ)
+#    จะกลายเป็น "สลับโหมดสำรอง" เงียบ ๆ แทนที่จะฟ้องออกมาให้แก้
+# ⚠️ ต้องใส่ openai.OpenAIError ด้วย — error จาก endpoint (ต่อไม่ติด/หมดเวลา/โควตาหมด/
+#    คีย์ผิด) สืบทอดจาก OpenAIError ไม่ใช่จาก ConnectionError ของ Python
+#    ตรวจแล้ว: APIConnectionError, APITimeoutError, RateLimitError, AuthenticationError
+#    ไม่มีตัวไหนเป็นลูกของ ConnectionError/OSError เลย — ดักด้วย built-in อย่างเดียวจับไม่ได้
+try:
+    from openai import OpenAIError as _OpenAIError
+except Exception:                      # ไม่มี openai ก็ยังต้องรันได้
+    _OpenAIError = ()
+SEMANTIC_DOWN = tuple(x for x in (_OpenAIError, ConnectionError, TimeoutError, OSError) if x)
+
+
 @traced("RETRIEVER")
 def retrieve(query: "str | list[str]", k: int = TOP_K,
              rerank_query: "Optional[str]" = None,
              groups: "Optional[list[str]]" = None,
              years: "Optional[list[int]]" = None,
              versions: "Optional[list[int]]" = None,
-             on_stage: "Optional[Callable[[str], None]]" = None) -> list[dict]:
+             on_stage: "Optional[Callable[[str], None]]" = None,
+             stats: "Optional[dict]" = None) -> list[dict]:
     """retrieve แบบ hybrid (semantic + BM25 รวมด้วย RRF)
     query เป็น str เดียว หรือ list[str] (multi-query RAG-Fusion):
       หลาย query → ค้นแยกกันทุกอัน แล้ว RRF รวม "ทุก ranked list" → top-k
@@ -1040,13 +1055,35 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
     # ถ้าไม่บอกอะไรเลยผู้ใช้จะคิดว่าโปรแกรมค้าง
     say = on_stage or (lambda _s: None)
 
+    # ⚠️ โหมดต้องเป็นตัวแปรในฟังก์ชัน ห้ามเป็น global — retrieve ถูกเรียกจากเธรดแยก
+    #    (service._retrieve_live) และ FastAPI รับหลายคำถามพร้อมกันได้
+    #    ถ้าเก็บใน global คำถามที่ปกติจะไปทับค่าของคำถามที่ล่ม แล้วคนนั้นจะไม่ได้รับคำเตือน
+    #    ซึ่งคือปัญหา "คุณภาพตกโดยไม่มีใครรู้" ที่ทั้งหมดนี้ตั้งใจจะแก้พอดี
+    #    ผู้เรียกที่อยากรู้โหมด ส่ง dict มาทาง stats= แล้วอ่านค่าหลังฟังก์ชันคืนค่า
+    mode = "hybrid"
+
     fuse: dict[str, float] = {}
     for qi, q in enumerate(queries, 1):
         say(f"ค้นมุมที่ {qi}/{len(queries)} จาก {len(_chunks):,} ตัวบท")
         # 1) semantic (Chroma cosine + กรอง group ด้วย where ในตัว)
-        qv = _embeddings.embed_query(q)
-        res = _collection.query(query_embeddings=[qv], n_results=n_res, where=where)
-        sem_ids = (res["ids"][0] if res.get("ids") else [])[:pool]
+        #    embedding ยิงไป endpoint ภายนอก จึงล่มได้ (โควตาหมด/เน็ตหลุด) — เคยเจอจริง
+        #    ถ้าล่มแล้วปล่อย exception ขึ้นไป เส้นค้นตายทั้งเส้นทั้งที่ BM25 ยังทำงานได้
+        #    (BM25 คำนวณในเครื่อง ไม่ต้องต่อเน็ต) วัดแล้วพบว่า BM25 อย่างเดียวได้ 24/30
+        #    เทียบกับ semantic อย่างเดียว 22/30 บนชุดหลัก — คือใช้งานได้จริง ไม่ใช่แค่ประคอง
+        #    ⚠️ ห้ามตกโหมดนี้แบบเงียบ ๆ — ตั้ง _last_mode ให้ผู้เรียกเอาไปบอกผู้ใช้เสมอ
+        sem_ids: list = []
+        if mode == "hybrid":
+            try:
+                qv = _embeddings.embed_query(q)
+                res = _collection.query(query_embeddings=[qv], n_results=n_res, where=where)
+                sem_ids = (res["ids"][0] if res.get("ids") else [])[:pool]
+            except SEMANTIC_DOWN as e:
+                # ล้มครั้งเดียวก็เลิกลองทั้งรอบ — มุมที่เหลือใช้ endpoint เดียวกัน
+                # ลองซ้ำมีแต่จะเสียเวลา timeout ทีละมุม
+                mode = "bm25_only"
+                say(f"⚠️ ค้นด้วยความหมายใช้ไม่ได้ ({type(e).__name__}) "
+                    f"— สลับไปค้นด้วยคำอย่างเดียว")
+                trace_note("embedding_failed", outputs={"error": type(e).__name__})
 
         # 2) keyword (BM25)
         scores = _bm25.get_scores(tokenize(q))
@@ -1087,6 +1124,8 @@ def retrieve(query: "str | list[str]", k: int = TOP_K,
     out = _boost_exact_article(ranked, wanted)[:k]
     arts = [c.get("article", "") for c in out[:4] if c.get("article")]
     say("เจอ " + (", ".join(arts) if arts else f"{len(out)} ก้อน"))
+    if stats is not None:
+        stats["mode"] = mode          # ผู้เรียกอ่านต่อได้ว่ารอบนี้ตกโหมดสำรองไหม
     return out
 
 

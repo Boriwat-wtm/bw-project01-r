@@ -409,9 +409,12 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     yield {"stage": "แตกคำถามเป็นหลายมุมค้นหา"}
     search_qs = rag.expand_queries(llm, search_q, domain=domain)
 
+    # rstats รับโหมดที่ retrieve ใช้จริงกลับมา — ต้องเป็น dict ต่อคำถาม ไม่ใช่ตัวแปรกลาง
+    # เพราะ retrieve รันในเธรดแยกและรับหลายคำถามพร้อมกันได้ (ดูคอมเมนต์ใน rag.retrieve)
+    rstats: "dict[str, str]" = {}
     chunks = yield from _retrieve_live(
         query=search_qs, rerank_query=search_q, groups=filter_groups,
-        years=year_filter, versions=versions or None)
+        years=year_filter, versions=versions or None, stats=rstats)
     # ── เติม "ข้อมูลที่คำนวณจากเอกสารด้วยโค้ด" ไว้หัว context ────────────────
     # ไม่ใช่การสั่ง LLM ผ่าน prompt (ซึ่งกระทบทุกคำถามและโมเดลอาจไม่ทำตาม)
     # แต่เป็นการรับประกันว่าข้อเท็จจริงชี้ขาดอยู่ใน context แน่นอน — และตรวจย้อนได้ว่ามาจากไหน
@@ -433,7 +436,14 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     context = rag.format_context(chunks)
     if facts:
         context = "\n\n".join(facts) + "\n\n" + "=" * 16 + "\n\n" + context
+    # ⚠️ ถ้า retrieve ตกไปโหมดสำรอง (embedding ล่ม เหลือแต่ BM25) ต้องบอกให้รู้ทุกทาง
+    #    ทั้ง event ที่ UI อ่าน และตัวคำตอบเอง — คุณภาพลดลงแบบเงียบ ๆ คือสิ่งที่อันตรายที่สุด
+    retrieval_mode = rstats.get("mode", "hybrid")
+    degraded = retrieval_mode == "bm25_only"
+    if degraded:
+        yield {"stage": "⚠️ ค้นด้วยคำอย่างเดียว (ระบบค้นด้วยความหมายใช้ไม่ได้ชั่วคราว)"}
     yield {"meta": {"groups": groups_used, "n_sources": len(chunks),
+                    "retrieval_mode": retrieval_mode,
                     "search_q": search_q if search_q != question else ""}}
 
     # 4) ประกอบข้อความ: system (ตามโดเมน) + ประวัติล่าสุด + (เอกสาร + คำถามปัจจุบัน)
@@ -448,8 +458,15 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     yield {"stage": "เขียนคำตอบ"}
     answer, reasoning = yield from _stream_answer(llm, messages, stream)
 
+    # ติดป้ายบนตัวคำตอบด้วย — ไม่ใช่แค่ event เพราะคำตอบอาจถูกก๊อปไปใช้ต่อโดยไม่มี event ติดไป
+    if degraded:
+        answer = ("> ⚠️ **คำตอบนี้ค้นด้วยคำสำคัญอย่างเดียว** เพราะระบบค้นด้วยความหมาย"
+                  "ใช้ไม่ได้ชั่วคราว อาจหาตัวบทที่ใช้คำต่างจากคำถามไม่เจอ "
+                  "— ควรตรวจสอบซ้ำหรือถามใหม่ภายหลัง\n\n" + answer)
+
     yield {"final": {"answer": answer, "chunks": chunks, "reasoning": reasoning,
                      "groups_used": groups_used, "elapsed": time.perf_counter() - t0,
+                     "retrieval_mode": retrieval_mode,
                      "search_q": search_q if search_q != question else ""}}
 
 
