@@ -28,6 +28,8 @@ numpy==2.4.4
 
 # eval / ground truth (eval/run_eval.py, eval/smoke_test.py)
 pandas==2.3.3
+# requests/urllib3 ใช้ใน eval/ocr_bench.py --engine company เท่านั้น (ไม่ตรึงเพราะติดมากับ
+# chromadb/mlflow อยู่แล้ว) — ระบบหลักไม่ได้เรียก HTTP ตรง ๆ ใช้ผ่าน langchain/openai client
 
 # experiment tracking (log ผลขึ้น MLflow server — ตั้ง MLFLOW_TRACKING_URI ใน .env)
 mlflow==3.14.0
