@@ -1797,8 +1797,15 @@ def domain_of_group(group: str) -> str:
     return "thai_law"
 
 
-def build_llm():
-    """คืน ChatOpenAI ชี้ไป endpoint ใหม่ (OpenAI-compatible) — direct RAG"""
+def build_llm(model: "Optional[str]" = None):
+    """คืน ChatOpenAI ชี้ไป endpoint ใหม่ (OpenAI-compatible) — direct RAG
+
+    model=None -> ใช้ LLM_MODEL ตามค่าเริ่มต้น
+    ส่งชื่อมา   -> สร้าง client ของรุ่นนั้นโดย "ไม่แตะ" LLM_MODEL
+                   (ผู้เรียกที่รับหลายคำขอพร้อมกันต้องใช้ทางนี้ ไม่งั้นคนหนึ่งเปลี่ยนรุ่น
+                    แล้วค่าเริ่มต้นของทุกคนเปลี่ยนตามถาวร)
+    """
+    name = model or LLM_MODEL
     if not LLM_API_KEY:
         raise RuntimeError(
             "ยังไม่ได้ตั้ง env var LLM_API_KEY\n"
@@ -1809,12 +1816,12 @@ def build_llm():
     # จน max_tokens หมดก่อนออกคำตอบจริง (finish_reason=length, content ว่าง)
     # ต้องส่งผ่าน chat_template_kwargs (top-level enable_thinking ไม่มีผลกับ endpoint นี้)
     # gemma ไม่โดน — เงื่อนไขจับเฉพาะ qwen
-    if "qwen" in LLM_MODEL.lower():
+    if "qwen" in name.lower():
         extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     return ChatOpenAI(
         base_url=LLM_BASE_URL,
         api_key=LLM_API_KEY,
-        model=LLM_MODEL,
+        model=name,
         temperature=0,
         max_tokens=8000,   # เผื่อโมเดล thinking คิดยาว — ให้พื้นที่พอออก 'คำตอบจริง' หลังคิดเสร็จ
         timeout=int(os.environ.get("LLM_TIMEOUT", "600")),  # กันแขวนถาวร (ตั้งผ่าน env ได้)
