@@ -710,6 +710,108 @@ def answer_graph(llm, question: str, groups: list, verbose: bool = True) -> dict
     return r
 
 
+# ── วิธี I: agent แบบ tool calling — โมเดลเลือกเครื่องมือเองแล้ววนจนพอ ─────────
+# ที่มา: LangChain แนะนำ create_agent ("model calling tools in a loop") จึงลองวัดดู
+# ว่าถ้าคืนอำนาจตัดสินใจให้โมเดลเต็มที่ จะดีกว่าการเดินตามกฎในโค้ดไหม
+#
+# ⚠️ ไม่ได้ใช้ langchain.agents.create_agent จริง เพราะต้องลง langchain + langgraph เพิ่ม
+#    ซึ่งจะแตะชุดเวอร์ชันที่ตรึงไว้ (requirements.txt บอกเองว่าห้ามขยับโดยไม่วัดใหม่)
+#    เขียนลูปเองด้วย bind_tools() ที่มีอยู่แล้วแทน — กลไกเหมือนกัน คือ
+#    โมเดลเลือก tool -> เรารันให้ -> ส่งผลกลับ -> โมเดลเลือกต่อ จนกว่าจะเลิกเรียก tool
+#
+# ต่างจากวิธี B (multi-hop เดิม) ตรงที่ B ให้เลือกได้อย่างเดียวคือ "ค้นอีกรอบ"
+# แต่ I มีเมนูให้เลือก 3 อย่าง และโมเดลตัดสินใจเองว่าจะใช้อันไหน เมื่อไร พอเมื่อไร
+AGENT_MAX_STEPS = 6        # เพดานกันวนไม่จบ — agent ไม่มีอะไรบังคับให้หยุดเอง
+
+
+def _agent_tools(groups: list):
+    """เครื่องมือที่ยกให้ agent เลือกใช้ — ตรงกับความสามารถที่ระบบมีอยู่แล้วทุกตัว"""
+    from langchain_core.tools import tool
+
+    box: dict = {"chunks": []}
+
+    @tool
+    def search_law(query: str) -> str:
+        """ค้นตัวบทกฎหมายที่ดินจากข้อความค้นหา คืนตัวบทที่เกี่ยวข้องที่สุด"""
+        cs = rag.retrieve(query, rerank_query=query, groups=groups)
+        box["chunks"] += [c for c in cs if c["id"] not in
+                          {x["id"] for x in box["chunks"]}]
+        return rag.format_context(cs)[:4000] or "ไม่พบตัวบทที่เกี่ยวข้อง"
+
+    @tool
+    def amendment_chain(article: str) -> str:
+        """ดูสายการแก้ไขทั้งหมดของมาตราที่ระบุ (เช่น '61' หรือ '9/1')
+        บอกได้ว่าถูกแก้ครั้งแรกโดยกฎหมายใด และถูกแก้ต่ออีกกี่ครั้ง"""
+        chain = rag.article_chain(rag.ARTICLE_ALIASES.get(article, article))
+        return rag.format_chain(article, chain) if chain else "มาตรานี้ไม่เคยถูกแก้ไข"
+
+    @tool
+    def articles_of(entity: str) -> str:
+        """ดูว่า 'ผู้มีอำนาจ' หรือ 'ชื่อเอกสาร' ที่ระบุ ถูกกล่าวถึงในมาตราใดบ้าง (ครบทุกมาตรา)
+        เช่น 'อธิบดี' 'เจ้าพนักงานที่ดิน' 'ใบจอง' — ใช้ตอบคำถามแบบรวบรวมให้ครบ"""
+        return rag.entity_articles(entity) or f"ไม่มี '{entity}' ในดัชนี"
+
+    return [search_law, amendment_chain, articles_of], box
+
+
+AGENT_SYS = (
+    "คุณคือผู้ช่วยตอบคำถามประมวลกฎหมายที่ดินไทย\n"
+    "- ใช้เครื่องมือที่มีเพื่อหาข้อเท็จจริงก่อนตอบ เรียกกี่ครั้งก็ได้จนกว่าจะมั่นใจ\n"
+    "- ตอบจากผลเครื่องมือเท่านั้น ห้ามใช้ความรู้ภายนอก ห้ามเดาเลขมาตรา\n"
+    "- ระบุเลขมาตราที่อ้างอิงทุกครั้ง\n"
+    "- เมื่อข้อมูลพอแล้ว ให้ตอบเป็นข้อความ ไม่ต้องเรียกเครื่องมืออีก"
+)
+
+
+def answer_agent(llm, question: str, groups: list, verbose: bool = True) -> dict:
+    """วิธี I: ให้โมเดลเลือกเครื่องมือเองในลูป (แบบเดียวกับ create_agent)"""
+    from langchain_core.messages import AIMessage, ToolMessage
+    t0 = time.perf_counter()
+    tools, box = _agent_tools(groups)
+    by_name = {t.name: t for t in tools}
+    bound = llm.bind_tools(tools)
+
+    msgs: list = [SystemMessage(content=AGENT_SYS), HumanMessage(content=question)]
+    hop_log: list = []
+    answer, stop = "", f"ชนเพดาน {AGENT_MAX_STEPS} ก้าว"
+
+    for step in range(1, AGENT_MAX_STEPS + 1):
+        try:
+            r = bound.invoke(msgs)
+        except Exception as e:
+            stop = f"พังที่ก้าว {step}: {type(e).__name__}"
+            if verbose:
+                print(f"    [!] {stop}")
+            break
+        rag.track_usage(r)
+        calls = getattr(r, "tool_calls", None) or []
+        if not calls:                                   # เลิกเรียก tool = ตอบแล้ว
+            answer = str(r.content)
+            stop = f"โมเดลหยุดเองที่ก้าว {step}"
+            if verbose:
+                print(f"    ก้าว {step}: ตอบ (ไม่เรียกเครื่องมือแล้ว)")
+            break
+        msgs.append(AIMessage(content=r.content, tool_calls=calls))
+        used = []
+        for c in calls:
+            fn = by_name.get(c["name"])
+            out = fn.invoke(c["args"]) if fn else f"ไม่มีเครื่องมือชื่อ {c['name']}"
+            msgs.append(ToolMessage(content=str(out)[:6000], tool_call_id=c["id"]))
+            used.append(f"{c['name']}({list(c['args'].values())[0] if c['args'] else ''})")
+        hop_log.append({"step": step, "tools": used})
+        if verbose:
+            print(f"    ก้าว {step}: เรียก {', '.join(used)}")
+
+    if not answer:                                      # ชนเพดาน -> บังคับให้สรุป
+        msgs.append(HumanMessage(content="ข้อมูลพอแล้ว ตอบคำถามเดิมเป็นข้อความทันที"))
+        try:
+            answer = str(llm.invoke(msgs).content)
+        except Exception as e:
+            answer = f"(ตอบไม่ได้: {type(e).__name__})"
+    return {"answer": answer, "hops": hop_log, "n_chunks": len(box["chunks"]),
+            "stop_reason": stop, "elapsed": round(time.perf_counter() - t0, 1)}
+
+
 # ── ทะเบียนวิธี — ชื่อในนี้คือชื่อ trace ที่จะเห็นใน MLflow ────────────────────
 MAX_HOPS = 5          # เพดานกัน LLM วนไม่จบ (ปกติมันบอก ENOUGH เองก่อนถึง)
 
@@ -731,6 +833,8 @@ MODES = {
           lambda llm, q, g: answer_entity_index(llm, q, g)),
     "H": ("H_json_structured", "G + บังคับสกัดเป็น JSON แล้วให้โค้ดตรวจความครบก่อนเรียบเรียง",
           lambda llm, q, g: answer_json_structured(llm, q, g)),
+    "I": ("I_agent_toolcalling", f"Agent: โมเดลเลือกเครื่องมือเองในลูป (เพดาน {AGENT_MAX_STEPS} ก้าว)",
+          lambda llm, q, g: answer_agent(llm, q, g)),
 }
 DEFAULT_MODES = ["A", "B", "C"]
 
