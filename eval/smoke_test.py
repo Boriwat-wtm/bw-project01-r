@@ -12,6 +12,7 @@ smoke_test.py — ชุดตรวจเร็ว ไม่เรียก LLM
 
 ออก exit code 1 ถ้ามีข้อไหนตก เอาไปต่อ CI ได้เลย
 """
+import inspect
 import os
 import sys
 
@@ -106,6 +107,51 @@ def test_question_intent():
           not service.detect_compare("ฉบับที่ ๑๒ พ.ศ. ๒๕๕๑ ยกเลิกหมวดใด"))
     check("'ยกเลิกความในมาตรา' (ฝั่งฉบับแก้ไข) ต้องไม่เข้าเส้นทาง chain",
           not service.detect_compare("ฉบับที่ ๔ ยกเลิกความในมาตรา ๖๑ จริงหรือไม่"))
+    # "ฉบับ" ในกฎหมายไทยมีสองความหมาย: จำนวน พ.ร.บ. ที่มาแก้ กับ จำนวนใบสำเนา
+    # เดิม _COMPARE_HINT จับ "กี่ฉบับ" ลอย ๆ ทำให้คำถามเรื่องจำนวนใบไหลไปตอบประวัติมาตรา
+    check("'กี่ฉบับ' ที่หมายถึงจำนวนใบ ต้องไม่เข้าเส้นทาง chain",
+          not service.detect_compare("โฉนดที่ดินตามมาตรา ๕๗ ต้องทำกี่ฉบับ"))
+    check("'กฎหมายกี่ฉบับ' ที่หมายถึงจำนวน พ.ร.บ. ต้องเข้าเส้นทาง chain",
+          service.detect_compare("มาตรา ๖๙ ทวิ ถูกแก้ไขโดยกฎหมายกี่ฉบับ และฉบับใดบ้าง") == "69 ทวิ")
+
+
+def test_multiturn_routing():
+    """คำถามต่อเนื่อง: การเขียนคำถามใหม่ต้องไม่มีสิทธิ์เปลี่ยน 'เส้นทาง' ของระบบ
+
+    เจอจากชุด eval/multiturn.json ข้อ M4 — ผู้ใช้เปลี่ยนเรื่องกลางบทสนทนา
+    แต่ rewrite_followup ลากเลขมาตราจากเทิร์นก่อนมาใส่ ทำให้ระบบเปลี่ยนไป
+    เดินเส้นเปรียบเทียบแล้วตอบประวัติมาตราเก่าแทนคำถามที่ถามจริง (ผิดทั้งข้อ)
+    """
+    section("คำถามต่อเนื่อง (multi-turn)")
+    # ── สิทธิ์ยืมเลขมาตราจากบทสนทนา ──
+    check("คำถามที่เขียน 'มาตรานี้' ยืมเลขมาตราจากประวัติได้",
+          service._may_borrow_article("มาตรานี้ถูกแก้ไขโดยกฎหมายฉบับใด"))
+    check("คำถามที่มีเลขมาตราของตัวเอง ไม่ถือว่ายืมใคร",
+          service._may_borrow_article("มาตรา ๓๑ ถูกแก้ไขกี่ครั้ง"))
+    check("คำถามที่เปลี่ยนเรื่อง (ไม่มีทั้งเลขมาตราและคำอ้างถึง) ยืมไม่ได้",
+          not service._may_borrow_article("โฉนดที่ดินต้องทำกี่ฉบับ และเก็บไว้ที่ใดบ้าง"))
+
+    # ── เติมเลขมาตราให้ 'มาตรานี้' ด้วยโค้ด ไม่ต้องรอ LLM ──
+    hist = [{"role": "user", "content": "ตามมาตรา ๑๑๑ ผู้ฝ่าฝืนมาตรา ๘๖ มีโทษเท่าใด"},
+            {"role": "assistant", "content": "ปรับไม่เกินสองหมื่นบาท จำคุกไม่เกินสองปี"}]
+    q = "มาตรานี้ถูกแก้ไขโดยกฎหมายฉบับใด"
+    got = service.carry_article(q, q, hist)
+    check("'มาตรานี้' ต้องถูกแทนด้วยเลขมาตราล่าสุดในบทสนทนา",
+          "111" in got, got)
+    check("คำถามที่มีเลขมาตราอยู่แล้ว ต้องไม่ถูกแตะ",
+          service.carry_article("มาตรา ๙ ห้ามทำอะไร", "มาตรา ๙ ห้ามทำอะไร", hist)
+          == "มาตรา ๙ ห้ามทำอะไร")
+    # "นี้" ที่อ้างถึงคำนามอื่น ห้ามถูกแทนด้วยเลขมาตรา — จะเพี้ยนหนักกว่าเดิม
+    check("'โฉนดนี้' ต้องไม่ถูกเติมเลขมาตรา",
+          service.carry_article("โฉนดนี้ออกเมื่อใด", "โฉนดนี้ออกเมื่อใด", hist)
+          == "โฉนดนี้ออกเมื่อใด")
+    check("ไม่มีประวัติ ต้องคืนคำถามเดิม",
+          service.carry_article(q, q, []) == q)
+
+    # ── เส้นทางเปรียบเทียบต้องรายงานคำถามที่เขียนใหม่ (เดิมส่ง "" ตายตัว) ──
+    src = inspect.getsource(service._answer_compare)
+    check("เส้นทางเปรียบเทียบต้องบอกผู้เรียกได้ว่าคำถามถูกเขียนใหม่",
+          '"search_q": reported_q' in src or "'search_q': reported_q" in src)
 
 
 def test_amendment_graph():
@@ -280,8 +326,8 @@ def test_no_superseded_leak():
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> int:
     for fn in (test_index_integrity, test_thai_text, test_question_intent,
-               test_amendment_graph, test_entity_index, test_retrieval,
-               test_no_superseded_leak):
+               test_multiturn_routing, test_amendment_graph, test_entity_index,
+               test_retrieval, test_no_superseded_leak):
         try:
             fn()
         except Exception as e:                       # ให้ชุดที่เหลือรันต่อได้

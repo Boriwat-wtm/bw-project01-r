@@ -53,6 +53,8 @@ eval/**/*.json
 !eval/ground_truth_v3.json
 !eval/adversarial.json
 !eval/multihop.json
+# ⚠️ เฉพาะชื่อนี้เท่านั้น — ผลรัน eval/multiturn_<เวลา>.json ยังถูก ignore ตามเดิม
+!eval/multiturn.json
 # ผลดิบของการทดลองใน experiments/ — เก็บเฉพาะโค้ด ไม่เก็บไฟล์ผลรัน
 experiments/*_[0-9]*.json
 # ผลรันเก่าที่ย้ายไปเก็บ (ไม่ลบทิ้ง — เป็นหลักฐานการทดลอง แต่ไม่ต้องปนกับโค้ด)

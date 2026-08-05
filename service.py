@@ -56,13 +56,26 @@ _HISTORY_HINT = re.compile(
     r"เปลี่ยนแปลง|ต่างจาก|เทียบ|ยกเลิก|เพิ่มเติม"
 )
 
+# คำที่บ่งว่าคำถาม "อ้างถึงสิ่งที่พูดไปแล้ว" ในบทสนทนา — ใช้ตัดสินว่าคำถามนี้
+# มีสิทธิ์ยืมเลขมาตราจากเทิร์นก่อนมาใช้ไหม (ดู _may_borrow_article)
+_ANAPHORA_CUE = re.compile(r"นี้|นั้น|ดังกล่าว|ข้างต้น|อันนี้|ตัวนี้")
+
+# ผู้ใช้เขียน "มาตรานี้/มาตรานั้น" ตรง ๆ — แคบกว่า _ANAPHORA_CUE เพราะระบุชัดว่า
+# กำลังอ้างถึง "มาตรา" ไม่ใช่คำนามอื่น ("โฉนดนี้" ห้ามเข้าเงื่อนไขนี้)
+_ARTICLE_ANAPHORA = re.compile(r"(มาตรา|ข้อ)\s*(นี้|นั้น|ดังกล่าว|ข้างต้น)")
+
 # คำที่บ่งว่าต้องการ "ไล่ดูตัวบทข้ามฉบับ" ไม่ใช่ "ตัวบท ณ จุดเวลาใดจุดหนึ่ง"
 _COMPARE_HINT = re.compile(
     r"ต่างกัน|ต่างจาก|แตกต่าง|เปรียบเทียบ|เทียบ|ก่อนและหลัง|ก่อนกับหลัง|"
     r"ถูกแก้|เคยแก้|แก้ไขกี่|กี่ครั้ง|แก้เมื่อไร|แก้ไขเมื่อไร|ประวัติการแก้|"
     r"เปลี่ยนไปอย่างไร|เปลี่ยนแปลงอย่างไร|"
     # คำถามแนวไล่สาย (chain) — "ก่อนหน้าของก่อนหน้า", "ฉบับใดบ้าง", "ที่มาอย่างไร"
-    r"ก่อนหน้า|กี่ฉบับ|ฉบับใดบ้าง|ฉบับไหนบ้าง|ลำดับเวลา|ที่มาอย่างไร|มีที่มา|ยังมีอยู่|"
+    # ⚠️ "กี่ฉบับ" ลอย ๆ ใช้ไม่ได้ — "ฉบับ" ในกฎหมายไทยมีสองความหมายคนละเรื่อง
+    #    "ถูกแก้โดยกฎหมายกี่ฉบับ" = จำนวน พ.ร.บ. ที่มาแก้  (ต้องเข้าเส้นเทียบ)
+    #    "โฉนดต้องทำกี่ฉบับ"      = จำนวนใบสำเนา          (ห้ามเข้า — คนละเรื่องเลย)
+    #    เดิมจับทั้งสองแบบ ทำให้ "โฉนดตามมาตรา ๕๗ ทำกี่ฉบับ" ไหลไปตอบประวัติ ม.๕๗
+    r"ก่อนหน้า|กฎหมายกี่ฉบับ|แก้ไขกี่ฉบับ|แก้มากี่ฉบับ|กี่ฉบับแล้ว|"
+    r"ฉบับใดบ้าง|ฉบับไหนบ้าง|ลำดับเวลา|ที่มาอย่างไร|มีที่มา|ยังมีอยู่|"
     # ถามว่าส่วนต่าง ๆ ของมาตราเดียวกันมาจากฉบับใด (provenance ระดับวรรค)
     r"คนละฉบับ|มาจากกฎหมาย|มาจากฉบับ|แก้ไขโดยฉบับใด|"
     # ถามว่า "บทบัญญัตินี้มีมาตั้งแต่เมื่อไร" — คำตอบอยู่ใน amendment graph โดยตรง
@@ -88,6 +101,41 @@ def detect_compare(question: str) -> str:
         return ""
     arts = rag.question_articles(question)
     return arts[0] if arts else ""
+
+
+def carry_article(question: str, search_q: str, history: list) -> str:
+    """เติมเลขมาตราจากบทสนทนาให้คำถามที่เขียนว่า "มาตรานี้" แต่ไม่มีเลข
+
+    ทำไมต้องมี: rewrite_followup เป็นการเรียก LLM ซึ่งบางครั้งคืนคำถามเดิมมาดื้อ ๆ
+    (วัดได้จากชุด multiturn ข้อ M1) พอไม่มีเลขมาตรา ระบบก็ไปค้นด้วยคำว่า
+    "มาตรานี้ถูกแก้ไขโดยกฎหมายฉบับใด" ซึ่งไม่ชี้ไปที่ตัวบทไหนเลย — ได้ chunk เดียว
+
+    "มาตราไหนที่พูดถึงล่าสุด" เป็นข้อเท็จจริงที่โค้ดหาเองได้จากประวัติ
+    ไม่ต้องรอให้ LLM ยอมทำ (หลักเดิมของโปรเจกต์: ข้อเท็จจริงให้โค้ดคำนวณ)
+
+    เงื่อนไขแคบไว้ก่อน — ต้องเขียน "มาตรานี้/ข้อนั้น" ตรง ๆ และคำถามต้องไม่มี
+    เลขมาตราของตัวเองอยู่แล้ว (แค่ "โฉนดนี้" จึงไม่เข้าเงื่อนไข เพราะ "นี้"
+    ตัวนั้นอ้างถึงโฉนด ไม่ใช่มาตรา — เติมเลขมาตราเข้าไปจะเพี้ยนหนักกว่าเดิม)
+    """
+    if not history or rag.question_articles(search_q):
+        return search_q
+    if not _ARTICLE_ANAPHORA.search(question):
+        return search_q
+    for turn in reversed(recent_turns(history)):        # ใหม่สุดก่อน
+        arts = rag.question_articles(turn.get("content", ""))
+        if arts:
+            return _ARTICLE_ANAPHORA.sub(f"มาตรา {arts[0]}", search_q, count=1)
+    return search_q
+
+
+def _may_borrow_article(question: str) -> bool:
+    """คำถาม (ตัวที่ผู้ใช้พิมพ์จริง) มีสิทธิ์ "ยืมเลขมาตรา" จากบทสนทนาก่อนหน้าไหม
+
+    มีเลขมาตราของตัวเองอยู่แล้ว  -> ใช่ (ไม่ได้ยืมใคร)
+    มีคำอ้างถึง เช่น "มาตรานี้"   -> ใช่ (ตั้งใจอ้างของเดิมจริง ๆ)
+    ไม่มีทั้งสองอย่าง             -> ไม่ใช่ — คำถามสมบูรณ์ในตัวแล้ว ไม่ได้พูดถึงมาตราไหน
+    """
+    return bool(rag.question_articles(question) or _ANAPHORA_CUE.search(question or ""))
 
 
 @rag.traced("TOOL")
@@ -208,9 +256,13 @@ def rewrite_followup(llm, question: str, history: list) -> str:
         "Rewrite the user's latest question into a STANDALONE question that can be "
         "understood without the conversation — resolve pronouns and implied subjects "
         "from the history (e.g. 'แล้วโทษล่ะ' -> 'โทษของการเข้าไปยึดถือครอบครองที่ดินของรัฐคืออะไร').\n"
-        "- Keep any มาตรา/ข้อ number mentioned earlier if the new question refers to it.\n"
         "Rules:\n"
-        "- If the question is ALREADY standalone, return it UNCHANGED.\n"
+        "- If the question ALREADY makes sense on its own, return it UNCHANGED. "
+        "Users change topic mid-conversation; a new topic is NOT a follow-up.\n"
+        "- NEVER add a มาตรา/ข้อ number from the history unless the question "
+        "actually points back to it (e.g. 'มาตรานี้', 'มาตราดังกล่าว'). "
+        "Adding one that the user did not mean sends the search to the wrong law.\n"
+        "- Keep any มาตรา/ข้อ number mentioned earlier ONLY if the new question refers to it.\n"
         "- Keep the user's original language.\n"
         "- Reply with ONLY the question. No quotes, no explanation."
     )
@@ -321,16 +373,21 @@ def _stream_answer(llm, messages, stream: bool):
 
 
 def _answer_compare(llm, question: str, num: str, history: list,
-                    stream: bool, t0: float) -> Iterator[dict]:
+                    stream: bool, t0: float, search_q: str = "") -> Iterator[dict]:
     """เส้นทางเปรียบเทียบ: ไล่ตัวบทมาตรา num ข้ามทุกฉบับ -> ให้ LLM ชี้ว่าอะไรเปลี่ยนเมื่อไร
-    ไม่ใช้ embedding/BM25/rerank เลย — ดึงจาก metadata ตรง ๆ จึงไม่มีทางพลาดมาตรา"""
+    ไม่ใช้ embedding/BM25/rerank เลย — ดึงจาก metadata ตรง ๆ จึงไม่มีทางพลาดมาตรา
+
+    search_q = คำถามหลังเขียนใหม่ (ถ้าเป็นคำถามต่อเนื่อง) — รายงานออกไปให้ผู้เรียกเห็น
+    เดิมตรงนี้ส่ง "" ตายตัว ทำให้เส้นทางนี้ไม่เคยบอกเลยว่าคำถามถูกเขียนใหม่หรือยัง
+    ผู้เรียก API จึงตรวจไม่ได้ว่าระบบเข้าใจคำถามต่อเนื่องตรงกับที่ตั้งใจไหม"""
     yield {"stage": f"ไล่ตัวบทมาตรา {num} ข้ามทุกฉบับ"}
     points = rag.article_timeline(num)
     # สายการแก้ไขจาก amendment graph — ระบุ "ใครแก้ เมื่อไร ทับงานของใคร" แบบชี้ขาด
     # ต่างจาก timeline ที่บอกแค่ "ตัวบทเปลี่ยนตอนไหน" — สองอันนี้เสริมกัน
     chain = rag.article_chain(num)
+    reported_q = search_q if search_q and search_q != question else ""
     yield {"meta": {"groups": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
-                    "n_sources": len(points), "search_q": "",
+                    "n_sources": len(points), "search_q": reported_q,
                     "compare_article": num, "n_changes": max(0, len(points) - 1),
                     "chain_len": max(0, len(chain) - 1)}}
 
@@ -362,7 +419,7 @@ def _answer_compare(llm, question: str, num: str, history: list,
     answer, reasoning = yield from _stream_answer(llm, messages, stream)
     yield {"final": {"answer": answer, "chunks": points, "reasoning": reasoning,
                      "groups_used": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
-                     "elapsed": time.perf_counter() - t0, "search_q": ""}}
+                     "elapsed": time.perf_counter() - t0, "search_q": reported_q}}
 
 
 # ── core pipeline (generator — ไม่ผูก UI) ─────────────────────────────────────
@@ -383,13 +440,24 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
     if history:
         yield {"stage": "เข้าใจคำถามต่อเนื่อง"}
         search_q = rewrite_followup(llm, question, history)
+        # กันกรณี LLM ไม่ยอมแทน "มาตรานี้" ให้ — เติมเองจากประวัติด้วยโค้ด
+        search_q = carry_article(question, search_q, history)
 
     # 1) แยกเส้นทาง: คำถามเปรียบเทียบ/ประวัติของ "มาตราหนึ่ง ๆ" ใช้กลไกคนละแบบ
     #    เส้นทางปกติยุบเวอร์ชันซ้ำทิ้งเพื่อตอบว่ากฎหมายว่าอย่างไร ซึ่งทำลายข้อมูลที่การ
     #    เปรียบเทียบต้องใช้พอดี → ที่นี่จึงไปดึงตัวบทตามเลขมาตราตรง ๆ ข้าม RRF ทั้งหมด
     cmp_article = detect_compare(search_q)
+    # ⚠️ การเขียนคำถามต่อเนื่องใหม่ต้องไม่มีสิทธิ์ "เปลี่ยนเส้นทาง" ของระบบ
+    #    เจอจากชุด multiturn (M4): ผู้ใช้เปลี่ยนเรื่องเป็น "โฉนดต้องทำกี่ฉบับ"
+    #    แต่ rewrite ลาก "มาตรา ๓๑" จากเทิร์นก่อนมาใส่ พอมีเลขมาตราโผล่ + คำว่า
+    #    "กี่ฉบับ" ที่อยู่ใน _COMPARE_HINT อยู่แล้ว -> ไหลไปเส้นเปรียบเทียบ
+    #    แล้วตอบประวัติ ม.๓๑ แทนคำถามที่ถามจริง (ผิดทั้งข้อ ไม่ใช่แค่ไม่ครบ)
+    #    กติกา: ยืมเลขมาตราจากบทสนทนาได้ ก็ต่อเมื่อคำถามเดิมอ้างถึงมันจริง
+    if cmp_article and search_q != question and not _may_borrow_article(question):
+        cmp_article = ""
     if cmp_article:
-        yield from _answer_compare(llm, question, cmp_article, history, stream, t0)
+        yield from _answer_compare(llm, question, cmp_article, history, stream, t0,
+                                   search_q=search_q)
         return
 
     # 2) เลือกกลุ่มเอกสาร — ใช้กฎในโค้ด ไม่ใช่ LLM (ดูเหตุผลใน pick_groups)
