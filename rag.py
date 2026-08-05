@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import hashlib
+import threading
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -661,17 +662,30 @@ def load_pdf_chunks() -> list[dict]:
 
 
 # ── vector store + BM25 ───────────────────────────────────────────────────────
+# ⚠️ ของหนักทุกตัวข้างล่างนี้โหลดแบบ lazy และเก็บไว้ใน global
+#    FastAPI รัน endpoint แบบ def ใน threadpool = หลายเธรดเข้าพร้อมกันได้จริง
+#    เขียนแค่ "if X is None: โหลด" ไม่พอ เพราะทุกเธรดผ่านด่านตรวจพร้อมกันก่อนที่
+#    ตัวแรกจะโหลดเสร็จ แล้วต่างคนต่างโหลดคนละชุด
+#    วัดจริงแล้ว: ยิงพร้อมกัน 5 คำขอตอนเซิร์ฟเวอร์เพิ่งบูต -> โหลด reranker 5 ชุด
+#    (~600MB/ชุดบน GPU) และคำขอชุดนั้นใช้เวลา 67 วินาที เทียบกับ 7 วินาทีตอนอุ่นแล้ว
+#    RLock เพราะ _ensure_loaded เรียกตัวอื่นต่อ — เธรดเดิมต้องเข้าซ้อนได้
+_init_lock = threading.RLock()
+
+
 def _init_embeddings():
     global _embeddings
-    if _embeddings is None:
-        _m = EMBED_MODEL.lower()
-        if (EMBED_MODEL.startswith("text-embedding") or "ada" in _m
-                or _m.startswith("qwen/") or "/" in EMBED_MODEL):
-            # ada-002, qwen/qwen3-8b ฯลฯ — OpenAI-compatible endpoint เดียวกับ chat
-            _embeddings = OpenAIEmbeddings(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, model=EMBED_MODEL)
-        else:
-            # paraphrase-multilingual ฯลฯ — ผ่าน Ollama
-            _embeddings = OllamaEmbeddings(base_url=OLLAMA_BASE_URL, model=EMBED_MODEL)
+    if _embeddings is not None:      # ทางลัด: โหลดแล้วไม่ต้องแย่งล็อก
+        return
+    with _init_lock:
+        if _embeddings is None:
+            _m = EMBED_MODEL.lower()
+            if (EMBED_MODEL.startswith("text-embedding") or "ada" in _m
+                    or _m.startswith("qwen/") or "/" in EMBED_MODEL):
+                # ada-002, qwen/qwen3-8b ฯลฯ — OpenAI-compatible endpoint เดียวกับ chat
+                _embeddings = OpenAIEmbeddings(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, model=EMBED_MODEL)
+            else:
+                # paraphrase-multilingual ฯลฯ — ผ่าน Ollama
+                _embeddings = OllamaEmbeddings(base_url=OLLAMA_BASE_URL, model=EMBED_MODEL)
 
 
 _reranker = None
@@ -684,23 +698,29 @@ def _init_reranker():
       - jina-reranker-v3 → AutoModel + trust_remote_code + .rerank() (สร้างบน Qwen3)
       - อื่นๆ (bge ฯลฯ) → sentence-transformers CrossEncoder + .predict()"""
     global _reranker, _reranker_kind
-    if _reranker is None:
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if "jina" in RERANK_MODEL.lower():
-            from transformers import AutoModel
-            try:                     # transformers ใหม่ใช้ dtype, เก่าใช้ torch_dtype
-                m = AutoModel.from_pretrained(RERANK_MODEL, dtype="auto", trust_remote_code=True)
-            except TypeError:
-                m = AutoModel.from_pretrained(RERANK_MODEL, torch_dtype="auto", trust_remote_code=True)
-            _reranker = m.to(device).eval()
-            _reranker_kind = "jina"
-        else:
-            from sentence_transformers import CrossEncoder
-            _reranker = CrossEncoder(RERANK_MODEL, device=device, max_length=512)
-            _reranker_kind = "ce"
-        if os.environ.get("RAG_DEBUG") == "1":
-            print(f"    [rerank] โหลด {RERANK_MODEL} ({_reranker_kind}) บน {device.upper()}")
+    if _reranker is not None:        # ทางลัด: โหลดแล้วไม่ต้องแย่งล็อก
+        return _reranker
+    with _init_lock:
+        if _reranker is None:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if "jina" in RERANK_MODEL.lower():
+                from transformers import AutoModel
+                try:                 # transformers ใหม่ใช้ dtype, เก่าใช้ torch_dtype
+                    m = AutoModel.from_pretrained(RERANK_MODEL, dtype="auto", trust_remote_code=True)
+                except TypeError:
+                    m = AutoModel.from_pretrained(RERANK_MODEL, torch_dtype="auto", trust_remote_code=True)
+                model, kind = m.to(device).eval(), "jina"
+            else:
+                from sentence_transformers import CrossEncoder
+                model = CrossEncoder(RERANK_MODEL, device=device, max_length=512)
+                kind = "ce"
+            # ประกาศ _reranker เป็นตัวสุดท้ายเสมอ — เธรดอื่นใช้ตัวนี้เป็นสัญญาณว่า
+            # "โหลดเสร็จแล้ว" ถ้าตั้งก่อน _reranker_kind จะมีช่วงที่เห็นโมเดลแต่ยังไม่รู้ชนิด
+            _reranker_kind = kind
+            _reranker = model
+            if os.environ.get("RAG_DEBUG") == "1":
+                print(f"    [rerank] โหลด {RERANK_MODEL} ({kind}) บน {device.upper()}")
     return _reranker
 
 
@@ -756,9 +776,13 @@ def _init_chroma():
     global _chroma_client, _collection
     if _collection is not None:
         return
-    _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
-    _collection = _chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+    with _init_lock:                # เหตุผลเดียวกับ _init_reranker (ดูคอมเมนต์ที่ _init_lock)
+        if _collection is None:
+            client = chromadb.PersistentClient(path=CHROMA_DIR)
+            coll = client.get_or_create_collection(
+                name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+            _chroma_client = client
+            _collection = coll      # ประกาศตัวสุดท้าย = สัญญาณว่าพร้อมใช้
 
 
 def _chroma_metadata(c: dict) -> dict:
@@ -851,11 +875,19 @@ def _save_hashes():
 
 
 def _ensure_loaded():
-    """โหลด globals ให้พร้อม retrieve แม้ build_vectorstore ยังไม่ถูกเรียกในรอบนี้"""
+    """โหลด globals ให้พร้อม retrieve แม้ build_vectorstore ยังไม่ถูกเรียกในรอบนี้
+
+    ต้องอยู่ใต้ล็อกเหมือนตัวอื่น — ตัวนี้หนักที่สุดในบรรดา lazy init ทั้งหมด
+    (อ่าน PDF 53 ไฟล์ + ตัด chunk + สร้างดัชนี BM25) ถ้าหลายเธรดเข้าพร้อมกัน
+    จะอ่าน PDF ซ้ำกันคนละรอบทั้งชุด
+    """
     _init_embeddings()
     _init_chroma()
-    if _bm25 is None:               # BM25 อยู่ในหน่วยความจำ ต้อง build จาก chunks ทุกครั้งที่ import
-        _build_bm25(load_pdf_chunks())
+    if _bm25 is not None:           # ทางลัด: สร้างแล้วไม่ต้องแย่งล็อก
+        return
+    with _init_lock:
+        if _bm25 is None:           # BM25 อยู่ในหน่วยความจำ ต้อง build จาก chunks ทุกครั้งที่ import
+            _build_bm25(load_pdf_chunks())
 
 
 # ── retrieval (hybrid: semantic + BM25 via RRF) ───────────────────────────────
