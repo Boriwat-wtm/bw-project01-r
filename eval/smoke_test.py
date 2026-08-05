@@ -373,12 +373,37 @@ def test_no_superseded_leak():
         check(f"'{q[:32]}'", not leak, f"หลุดมา {len(leak)}: {leak[:2]}")
 
 
+def test_portable_index():
+    """ดัชนีที่ commit ไว้ต้องใช้ได้เมื่อ clone ไปเครื่องอื่น (โดยเฉพาะ Linux)
+
+    บักจริงที่เจอตอนเตรียม deploy: file_hashes.json เซฟคีย์เป็น 'data\\x.pdf' แบบ Windows
+    พอรันบน Linux ได้ 'data/x.pdf' -> ไม่ตรงทั้ง 53 ไฟล์ -> main.py สั่ง
+    build_vectorstore(force=True) -> ลบ collection แล้ว embed ใหม่ทั้งชุดตั้งแต่บูตแรก
+    """
+    section("ดัชนีย้ายเครื่องได้")
+    saved = rag.load_hashes()
+    check("file_hashes.json มีครบทุกไฟล์ใน data/",
+          len(saved) == len(rag._all_data_files()),
+          f"{len(saved)} vs {len(rag._all_data_files())}")
+    check("คีย์ใน file_hashes.json ใช้ '/' ไม่ใช่ '\\' (ย้าย OS แล้วยังตรง)",
+          bool(saved) and not any("\\" in k for k in saved),
+          f"เจอ backslash: {[k for k in saved if chr(92) in k][:2]}")
+    check("_rel_key คืนค่าเป็น '/' เสมอ",
+          "\\" not in rag._rel_key(os.path.join(rag.DATA_DIR, "x.pdf")))
+    check("บูตแล้วไม่สั่ง rebuild (ไม่ embed ใหม่โดยไม่จำเป็น)", not rag.update_database())
+
+    # ของที่ต้องมีจริงบนเครื่องปลายทาง ไม่งั้นบูตไม่ขึ้น
+    check("มีโฟลเดอร์ data/ พร้อม PDF", len(rag._all_data_files()) > 0)
+    check("มี chroma_db ที่มีเวกเตอร์อยู่จริง", rag._collection.count() > 0,
+          f"{rag._collection.count()} เวกเตอร์")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> int:
     for fn in (test_index_integrity, test_thai_text, test_question_intent,
                test_multiturn_routing, test_degrade_gracefully,
                test_amendment_graph, test_entity_index,
-               test_retrieval, test_no_superseded_leak):
+               test_retrieval, test_no_superseded_leak, test_portable_index):
         try:
             fn()
         except Exception as e:                       # ให้ชุดที่เหลือรันต่อได้

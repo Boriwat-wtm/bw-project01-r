@@ -23,8 +23,9 @@ gridgeist/
 .DS_Store
 Thumbs.db
 
-# RAG index (ใหญ่/generated — rebuild ด้วย: python -c "import rag; rag.build_vectorstore(force=True)")
-file_hashes.json
+# ⚠️ file_hashes.json "ต้อง" อยู่ใน repo คู่กับ chroma_db/ — main.py เรียก update_database()
+# ตอนบูต ถ้าไฟล์นี้หายจะถือว่าเอกสารเปลี่ยน แล้วสั่ง build_vectorstore(force=True)
+# = ลบดัชนีที่ขนมาทิ้งแล้ว embed ใหม่ทั้ง 2,068 ก้อน (เสียเงิน+เวลา ฟรี ๆ)
 
 # ประวัติแชท + feedback ของ UI (local/ส่วนตัว — generated)
 # ⚠️ feedback.jsonl เก็บ "คำถาม+คำตอบจริงของผู้ใช้" (main.py POST /v1/feedback) — ห้ามขึ้น repo
@@ -33,7 +34,8 @@ feedback.jsonl
 
 # Databases (เก่า/generated)
 *.db
-chroma_db/
+# chroma_db/ "ไม่" ignore แล้ว — เก็บขึ้น repo เพื่อให้ clone ไปเครื่องอื่นแล้วรันได้เลย
+# โดยไม่ต้อง embed ใหม่ (ตรวจแล้วข้างในมีแต่ตัวบทกฎหมายที่ดิน ไม่มีข้อมูลภายใน)
 # ดัชนีคู่ขนานตอนทดลองเทียบ embedding (embed_compare.py) — .gitignore ไม่รับคอมเมนต์ท้ายบรรทัด
 chroma_db_*/
 zvec_test/zvec_db/
@@ -64,8 +66,11 @@ eval/**/*.xlsx
 # โมเดล/แคชที่โหลดมา
 *.gguf
 
-# เอกสารต้นทาง PDF (25MB — เก็บนอก repo; เอามาวางใน data/ เองตอนใช้งาน)
-data/
+# เอกสารต้นทาง PDF 53 ไฟล์ (21.5MB) — "ต้อง" อยู่ใน repo
+# ไม่ใช่แค่ไว้สร้างดัชนี: rag._ensure_loaded() อ่าน PDF ใหม่ทุกครั้งที่บูตเพื่อสร้าง BM25
+# ในหน่วยความจำ และ doc_articles()/amendment_graph()/entity_index() ก็อ่านตรงจาก PDF
+# ถ้าไม่มี data/ ระบบจะบูตไม่ขึ้น แม้จะมี chroma_db ครบ
+# (เป็นเอกสารสาธารณะจากราชกิจจานุเบกษา — เผยแพร่ได้)
 
 # OCR cache (generated — local)
 ocr_cache/

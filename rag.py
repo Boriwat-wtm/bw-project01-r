@@ -138,15 +138,28 @@ def hash_file(path: str) -> str:
     return h.hexdigest()
 
 
-def load_hashes() -> dict:
+def _rel_key(path: str) -> str:
+    """คีย์ของไฟล์ใน file_hashes.json — บังคับใช้ '/' เสมอ ไม่ว่าอยู่ OS ไหน
+
+    ⚠️ เดิมใช้ os.path.relpath ตรง ๆ จึงได้ 'data\\x.pdf' บน Windows แต่ 'data/x.pdf'
+    บน Linux — พอย้ายเครื่อง hash จะไม่ตรง "ทั้ง 53 ไฟล์" ทั้งที่ไฟล์เหมือนกันเป๊ะ
+    แล้ว main.py จะเรียก build_vectorstore(force=True) = ลบ collection ทิ้งแล้ว
+    embed ใหม่ทั้งชุด (เสียเงิน+เวลา และ chroma_db ที่ขนไปด้วยก็สูญเปล่า)
+    """
+    return os.path.relpath(path, HERE).replace(os.sep, "/")
+
+
+def load_hashes() -> dict[str, str]:
     if os.path.exists(HASH_FILE):
-        with open(HASH_FILE, "r") as f:
-            return json.load(f)
+        with open(HASH_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        # ไฟล์เก่าที่เซฟจาก Windows เป็น '\' — แปลงตอนอ่าน จะได้ไม่ rebuild เก้อ
+        return {k.replace("\\", "/"): v for k, v in saved.items()}
     return {}
 
 
 def save_hashes(hashes: dict) -> None:
-    with open(HASH_FILE, "w") as f:
+    with open(HASH_FILE, "w", encoding="utf-8") as f:
         json.dump(hashes, f, indent=2)
 
 
@@ -779,7 +792,7 @@ def update_database() -> bool:
     if not files:
         print(f"[!] ไม่พบเอกสารใน {DATA_DIR} (รองรับ: {', '.join(sorted(SUPPORTED_EXTS))})")
         return False
-    cur = {os.path.relpath(p, HERE): hash_file(p) for p, _ in files}
+    cur = {_rel_key(p): hash_file(p) for p, _ in files}
     saved = load_hashes()
     if cur != saved:
         print(f"ตรวจพบไฟล์ใหม่/เปลี่ยนแปลง ({len(cur)} ไฟล์) — จะสร้างดัชนีใหม่")
@@ -885,7 +898,7 @@ def build_vectorstore(force: bool = False):
 def _save_hashes():
     """เซฟ hash ต่อไฟล์ (ไว้ตรวจรอบหน้าว่าต้อง rebuild ไหม)"""
     try:
-        cur = {os.path.relpath(p, HERE): hash_file(p) for p, _ in _all_data_files()}
+        cur = {_rel_key(p): hash_file(p) for p, _ in _all_data_files()}
         save_hashes(cur)
     except Exception as e:
         print(f"[!] บันทึก file hashes ไม่สำเร็จ: {e}")

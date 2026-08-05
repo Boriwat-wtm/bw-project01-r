@@ -197,7 +197,30 @@ PDF ──PyMuPDF──> chunk ตามขอบ "มาตรา/ข้อ" �
 | `experiments/` | โค้ดทดลอง **ไม่ได้ต่อเข้าระบบจริง** — `multihop_iterative.py` (โหมด A–I) · `hybrid_ablation.py` |
 | `docs/API.md` | คู่มือสำหรับคนที่มาเรียก API ของเรา |
 | `reports/` | รายงานผลวัดที่ยาวเกินใส่ README |
-| `data/` | PDF ต้นฉบับ 53 ไฟล์ — **ไม่อยู่ใน repo** (25 MB) ต้องเอามาวางเอง |
+| `data/` | PDF ต้นฉบับ 53 ไฟล์ (21.5 MB) — **อยู่ใน repo แล้ว** ไม่ใช่แค่ไว้สร้างดัชนี ระบบอ่านทุกครั้งที่บูต |
+| `chroma_db/` | ดัชนี semantic 2,068 เวกเตอร์ (72.8 MB) — **อยู่ใน repo แล้ว** clone ไปแล้วรันได้เลย ไม่ต้อง embed ใหม่ |
+| `file_hashes.json` | ลายนิ้วมือของ 53 ไฟล์ — **ต้องมาคู่กับ `chroma_db/` เสมอ** (ดูกับดักด้านล่าง) |
+
+### ย้ายไปรันเครื่องอื่น
+
+```bash
+git clone <repo> && cd Thai-Law-RAG
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pip install torch==2.6.0                    # มี GPU: เติม --index-url .../whl/cu124
+cp .env.example .env                        # แล้วเติม LLM_BASE_URL / LLM_API_KEY / API_KEY
+python eval/smoke_test.py                   # ← ต้องผ่าน 89/89 ก่อนเปิดเสิร์ฟ
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+`data/` กับ `chroma_db/` มาพร้อม repo แล้ว — ไม่ต้องคัดลอกอะไรเพิ่ม และ**ไม่เสียค่า embedding ใหม่**
+
+> ⚠️ **กับดักที่เจอตอนเตรียม deploy** — `main.py` เรียก `update_database()` ตอนบูต
+> ซึ่งเทียบ hash ของไฟล์ใน `data/` กับที่จำไว้ ถ้าไม่ตรงจะสั่ง `build_vectorstore(force=True)`
+> = **ลบดัชนีที่ขนมาทิ้งแล้ว embed ใหม่ทั้ง 2,068 ก้อน**
+> เดิมคีย์ถูกเซฟเป็น `data\x.pdf` แบบ Windows พอรันบน Linux `os.path.relpath` ให้ `data/x.pdf`
+> → ไม่ตรงทั้ง 53 ไฟล์ ทั้งที่ไฟล์เหมือนกันเป๊ะ · แก้ด้วย `rag._rel_key()` ที่บังคับ `/` เสมอ
+> (`load_hashes` แปลง `\` ของไฟล์เก่าให้ด้วย) + เทส `test_portable_index` 6 ข้อกันพลาดซ้ำ
 
 ### จุดที่ต้องระวัง
 
