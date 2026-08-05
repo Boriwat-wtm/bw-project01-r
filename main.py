@@ -69,6 +69,18 @@ async def lifespan(_app: FastAPI):
     rag.RERANK_ENABLED = os.environ.get("RAG_RERANK", "1") != "0"
     changed = rag.update_database()
     rag.build_vectorstore(force=changed)
+
+    # อุ่นเครื่องให้เสร็จ "ก่อน" บอกว่าพร้อม — ไม่งั้น /health ตอบ ok ตั้งแต่ยังไม่พร้อมจริง
+    #   1. BM25 + ตัวตัดคำ: ถ้าไม่เรียก TOKENIZER_KIND จะยังเป็น "?" แล้ว /health
+    #      รายงานสถานะเสื่อมไม่ได้เลยจนกว่าจะมีคำถามแรกเข้ามา
+    #   2. reranker: โหลดตอนใช้ครั้งแรก วัดแล้วทำให้คำถามแรกช้า ~85 วินาที
+    #      เทียบกับ ~8-20 วินาทีตอนอุ่นแล้ว — ผู้ใช้คนแรกไม่ควรเป็นคนจ่ายค่านี้
+    rag._ensure_loaded()
+    if rag.RERANK_ENABLED:
+        print("[i] อุ่น reranker...")
+        rag.rerank("ทดสอบ", [{"text": "ประมวลกฎหมายที่ดิน"}], 1)
+    print(f"[i] พร้อมใช้งาน — ตัดคำด้วย {rag.TOKENIZER_KIND} · "
+          f"rerank {'เปิด' if rag.RERANK_ENABLED else 'ปิด'}")
     yield
 
 
@@ -122,9 +134,17 @@ router = APIRouter(prefix=f"/{API_VERSION}", dependencies=[Depends(require_api_k
 
 @app.get("/health")
 def health():
-    """ไม่ต้องใช้คีย์ — ไว้ให้ตัวมอนิเตอร์เรียกเช็คว่าระบบยังอยู่"""
-    return {"status": "ok", "version": API_VERSION,
-            "chunks": len(rag._chunks), "model": rag.LLM_MODEL}
+    """ไม่ต้องใช้คีย์ — ไว้ให้ตัวมอนิเตอร์เรียกเช็คว่าระบบยังอยู่
+
+    tokenizer = "newmm" ปกติ · "bigram" แปลว่าไม่มี pythainlp แล้วการค้นด้วยคำหยาบลงมาก
+    เอามาโชว์ตรงนี้เพราะเดิมรู้ได้จาก log ตอนเปิดระบบเท่านั้น ซึ่งเลื่อนหายไปแล้ว
+    """
+    degraded = rag.TOKENIZER_KIND == "bigram"
+    return {"status": "degraded" if degraded else "ok", "version": API_VERSION,
+            "chunks": len(rag._chunks), "model": rag.LLM_MODEL,
+            "tokenizer": rag.TOKENIZER_KIND,
+            "rerank": rag.RERANK_ENABLED,
+            **({"warning": "ไม่มี pythainlp — ค้นด้วยคำทำงานแบบหยาบ (bigram)"} if degraded else {})}
 
 
 @router.get("/groups")

@@ -156,16 +156,33 @@ THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 _th_tokenizer = None
 
 
+# ตัวตัดคำที่ใช้อยู่จริง — "newmm" (ปกติ) หรือ "bigram" (เสื่อม: ไม่มี pythainlp)
+# ต้องอ่านได้จากข้างนอก เพราะ "คุณภาพตกโดยไม่มีใครรู้" คือบั๊กที่อันตรายที่สุดของระบบนี้
+# main.py เอาไปแสดงใน /health · smoke_test เช็คค่านี้ · ไม่ใช่แค่ print แล้วเลื่อนหาย
+TOKENIZER_KIND = "?"
+
+
 def _thai_words(s: str) -> list[str]:
     """ตัดคำไทยด้วย pythainlp (newmm) — ไม่มี lib ก็ถอยไปใช้ bigram ตัวอักษร
     (หยาบกว่า แต่ยังค้นเจอ ดีกว่าปล่อยให้ BM25 ไม่มี token ไทยเลย)"""
-    global _th_tokenizer
+    global _th_tokenizer, TOKENIZER_KIND
     if _th_tokenizer is None:
         try:
             from pythainlp.tokenize import word_tokenize
             _th_tokenizer = lambda t: word_tokenize(t, engine="newmm", keep_whitespace=False)
-        except Exception:
-            print("  [bm25] ไม่พบ pythainlp — ใช้ bigram ตัวอักษรแทน (ค้นไทยหยาบลง)")
+            TOKENIZER_KIND = "newmm"
+        except Exception as e:
+            TOKENIZER_KIND = "bigram"
+            # เดิมเตือนบรรทัดเดียวตอนเริ่มระบบแล้วเงียบไปตลอด ใครไม่ได้ดู log
+            # นาทีนั้นจะไม่มีทางรู้เลยว่าการค้นด้วยคำกำลังทำงานแบบหยาบอยู่
+            print("\n" + "!" * 72, file=sys.stderr)
+            print("!! ไม่พบ pythainlp — BM25 กำลังตัดคำไทยแบบหยาบ (bigram ทุก 2 ตัวอักษร)",
+                  file=sys.stderr)
+            print(f"!! สาเหตุ: {type(e).__name__}: {e}", file=sys.stderr)
+            print("!! ผลคือค้นด้วยคำแม่นลดลงมาก และไม่มีอะไรบอกผู้ใช้ว่าคำตอบแย่ลง",
+                  file=sys.stderr)
+            print("!! แก้: pip install pythainlp   แล้วเปิดระบบใหม่", file=sys.stderr)
+            print("!" * 72 + "\n", file=sys.stderr)
             _th_tokenizer = lambda t: [t[i:i + 2] for i in range(len(t) - 1)] or [t]
     return _th_tokenizer(s)
 

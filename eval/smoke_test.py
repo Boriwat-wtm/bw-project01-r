@@ -24,6 +24,9 @@ except Exception:
 
 import rag        # noqa: E402
 import service    # noqa: E402
+# ⚠️ ต้อง alias — ไฟล์นี้มีฟังก์ชันชื่อ main() อยู่แล้ว ถ้า import ตรง ๆ
+#    def main() ข้างล่างจะทับชื่อโมดูลทิ้ง แล้ว main.health พังตอนรัน
+import main as api  # noqa: E402  (แค่ import โมดูล ไม่ได้สตาร์ทเซิร์ฟเวอร์)
 
 _results: list[tuple[bool, str, str]] = []
 
@@ -152,6 +155,53 @@ def test_multiturn_routing():
     src = inspect.getsource(service._answer_compare)
     check("เส้นทางเปรียบเทียบต้องบอกผู้เรียกได้ว่าคำถามถูกเขียนใหม่",
           '"search_q": reported_q' in src or "'search_q': reported_q" in src)
+
+
+def test_degrade_gracefully():
+    """ระบบเสื่อมได้ แต่ต้อง "เสื่อมแบบมีเสียง" — ห้ามเงียบ
+
+    บั๊กที่ใช้เวลาไล่จับนานที่สุดในโปรเจกต์นี้ทุกตัวมีหน้าตาเดียวกัน:
+    คุณภาพตกลงจริง แต่ไม่มีอะไรบอกใครเลย
+    """
+    section("เสื่อมแล้วต้องมีเสียง")
+
+    # ── 1. ไม่มี pythainlp -> BM25 ตัดคำหยาบ ต้องรู้ได้จากข้างนอก ──
+    check("มีตัวบอกว่าใช้ตัวตัดคำอะไรอยู่",
+          rag.TOKENIZER_KIND in ("newmm", "bigram"), rag.TOKENIZER_KIND)
+    check("เครื่องนี้ใช้ newmm อยู่จริง (ถ้าเป็น bigram แปลว่าลืมลง pythainlp)",
+          rag.TOKENIZER_KIND == "newmm", rag.TOKENIZER_KIND)
+    check("/health ต้องรายงานตัวตัดคำออกไปด้วย",
+          "TOKENIZER_KIND" in inspect.getsource(api.health))
+
+    # ── 2. LLM ล่ม -> ต้องคืนตัวบทที่ค้นเจอ ไม่ใช่ error เปล่า ──
+    chunks = rag.retrieve("โฉนดที่ดินต้องทำกี่ฉบับ", k=4)
+    fb = service.fallback_answer(chunks, ConnectionError("endpoint ล่ม"))
+    check("LLM ล่ม -> คำตอบสำรองต้องมีตัวบทจริงติดมาด้วย",
+          len(fb) > 300 and "มาตรา" in fb, f"{len(fb)} ตัวอักษร")
+    check("คำตอบสำรองต้องบอกชัดว่าไม่ได้เรียบเรียง",
+          "ยังไม่ได้เรียบเรียง" in fb)
+    check("คำตอบสำรองต้องบอกชนิดของข้อผิดพลาด",
+          "ConnectionError" in fb)
+    check("ไม่มีตัวบทเลยก็ต้องไม่พัง",
+          "ไม่พบ" in service.fallback_answer([], ConnectionError("x")))
+    # error ตัวจริงจาก endpoint ต้องเข้าเงื่อนไขนี้ ไม่ใช่แค่ ConnectionError ที่เราจำลอง
+    # (เคยพลาดมาแล้วตอนทำ BM25 fallback — เทสผ่านทั้งที่ของจริงยังพัง)
+    try:
+        import openai
+        for name in ("APIConnectionError", "APITimeoutError", "RateLimitError",
+                     "InternalServerError"):
+            cls = getattr(openai, name, None)
+            if cls:
+                check(f"openai.{name} ต้องถูกดักเป็น 'LLM ล่ม'",
+                      issubclass(cls, service.LLM_DOWN))
+    except ImportError:
+        check("import openai ได้", False, "ไม่พบ openai")
+
+    # ── 3. ส่ง chunks ไปให้ _stream_answer จริงทั้งสองเส้นทาง ──
+    for fn, label in ((service.answer_stream, "เส้นทางปกติ"),
+                      (service._answer_compare, "เส้นทางเปรียบเทียบ")):
+        check(f"{label} ต้องส่งตัวบทสำรองให้ _stream_answer",
+              "chunks=" in inspect.getsource(fn))
 
 
 def test_amendment_graph():
@@ -326,7 +376,8 @@ def test_no_superseded_leak():
 # ══════════════════════════════════════════════════════════════════════════════
 def main() -> int:
     for fn in (test_index_integrity, test_thai_text, test_question_intent,
-               test_multiturn_routing, test_amendment_graph, test_entity_index,
+               test_multiturn_routing, test_degrade_gracefully,
+               test_amendment_graph, test_entity_index,
                test_retrieval, test_no_superseded_leak):
         try:
             fn()

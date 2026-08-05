@@ -332,43 +332,89 @@ def _retrieve_live(**kw) -> Iterator[dict]:
     return box.get("out", [])
 
 
-def _stream_answer(llm, messages, stream: bool):
+# error ที่แปลว่า "endpoint คุยไม่ได้" — ตระกูลเดียวกับที่ retrieve ใช้ดัก embedding ล่ม
+# เพราะ chat กับ embedding ยิงไป endpoint เดียวกัน ล่มพร้อมกันเป็นเรื่องปกติ
+LLM_DOWN = rag.SEMANTIC_DOWN
+
+
+def fallback_answer(chunks: list, err: Exception, n: int = 6) -> str:
+    """LLM เขียนคำตอบไม่ได้ -> คืน "ตัวบทที่ค้นเจอ" ให้ผู้ใช้อ่านเอง
+
+    เดิมกรณีนี้ผู้ใช้ได้ error เปล่า ๆ ทั้งที่ระบบค้นตัวบทเจอแล้ว —
+    งานที่ทำไปแล้ว 90% ถูกทิ้งเพราะขั้นสุดท้ายพัง ทั้งที่ของที่ค้นได้มีค่าในตัวเอง
+    ทนายอ่านตัวบทเองได้ ขอแค่ชี้ให้ถูกมาตรา
+    """
+    head = ("> ⚠️ **ระบบเขียนคำตอบไม่สำเร็จ** "
+            f"({type(err).__name__}) — แต่ค้นตัวบทที่เกี่ยวข้องเจอแล้ว\n"
+            "> ข้างล่างคือตัวบทดิบเรียงตามความเกี่ยวข้อง **ยังไม่ได้เรียบเรียงและไม่ได้ตรวจ**\n"
+            "> ถ้าต้องการคำตอบที่เรียบเรียงแล้ว กรุณาถามใหม่อีกครั้ง\n")
+    if not chunks:
+        return head + "\n(ไม่พบตัวบทที่เกี่ยวข้องด้วย)"
+    parts = [head]
+    for c in chunks[:n]:
+        art = c.get("article") or "-"
+        page = c.get("page_start") or "-"
+        label = c.get("doc_label") or c.get("source") or ""
+        flag = "" if c.get("in_force") else "  ⚠️ ไม่ใช่ฉบับที่ใช้บังคับปัจจุบัน"
+        text = " ".join(str(c.get("text", "")).split())[:600]
+        parts.append(f"\n**{art}** · หน้า {page} · {label}{flag}\n\n{text} …")
+    return "\n".join(parts)
+
+
+def _stream_answer(llm, messages, stream: bool, chunks: "Optional[list]" = None):
     """ยิง messages เข้า LLM แล้ว yield token — ใช้ร่วมกันทั้งสองเส้นทาง
-    คืน (answer, reasoning) ผ่าน StopIteration value ของ generator"""
+    คืน (answer, reasoning) ผ่าน StopIteration value ของ generator
+
+    chunks: ส่งมาด้วยแล้ว ถ้า LLM ล่มจะคืนตัวบทเหล่านี้แทน error เปล่า
+            (None = ไม่มีของสำรอง ปล่อย exception ขึ้นไปตามเดิม)
+    """
     answer, reasoning = "", ""
-    if stream:
-        full = None
-        try:
-            gen = llm.stream(messages, stream_usage=True)
-        except TypeError:
-            gen = llm.stream(messages)
-        for chunk in gen:
-            full = chunk if full is None else full + chunk
-            ak = getattr(chunk, "additional_kwargs", {}) or {}
-            rc = ak.get("reasoning_content") or ak.get("reasoning") or ""
-            c = str(getattr(chunk, "content", "") or "")
-            if rc and not answer:
-                reasoning += str(rc)
-                yield {"reasoning": str(rc)}
-            if c:
-                answer += c
-                yield {"token": c}
-        if not answer and reasoning:      # thinking model ที่ส่งมาแต่ reasoning
-            answer = reasoning
-        if full is not None:
-            rag.track_usage(full)
-        # จดลง trace: สาย stream เรียก llm.stream ตรง ๆ ไม่ผ่าน invoke_retry
-        # เลยไม่มี span LLM ของตัวเอง — จด prompt+คำตอบเต็มไว้ตรงนี้แทน
-        rag.trace_note("llm_stream_answer",
-                       inputs={"messages": [str(getattr(m, "content", "")) for m in messages]},
-                       outputs={"answer": answer, "reasoning": reasoning})
-    else:
-        resp = rag.invoke_retry(llm, messages,
-                                ok_fn=lambda c: not rag.looks_truncated(c), label="answer")
-        answer = str(resp.content)
-        ak = getattr(resp, "additional_kwargs", {}) or {}
-        reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
-        yield {"token": answer}
+    try:
+        if stream:
+            full = None
+            try:
+                gen = llm.stream(messages, stream_usage=True)
+            except TypeError:
+                gen = llm.stream(messages)
+            for chunk in gen:
+                full = chunk if full is None else full + chunk
+                ak = getattr(chunk, "additional_kwargs", {}) or {}
+                rc = ak.get("reasoning_content") or ak.get("reasoning") or ""
+                c = str(getattr(chunk, "content", "") or "")
+                if rc and not answer:
+                    reasoning += str(rc)
+                    yield {"reasoning": str(rc)}
+                if c:
+                    answer += c
+                    yield {"token": c}
+            if not answer and reasoning:      # thinking model ที่ส่งมาแต่ reasoning
+                answer = reasoning
+            if full is not None:
+                rag.track_usage(full)
+            # จดลง trace: สาย stream เรียก llm.stream ตรง ๆ ไม่ผ่าน invoke_retry
+            # เลยไม่มี span LLM ของตัวเอง — จด prompt+คำตอบเต็มไว้ตรงนี้แทน
+            rag.trace_note("llm_stream_answer",
+                           inputs={"messages": [str(getattr(m, "content", "")) for m in messages]},
+                           outputs={"answer": answer, "reasoning": reasoning})
+        else:
+            resp = rag.invoke_retry(llm, messages,
+                                    ok_fn=lambda c: not rag.looks_truncated(c), label="answer")
+            answer = str(resp.content)
+            ak = getattr(resp, "additional_kwargs", {}) or {}
+            reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+            yield {"token": answer}
+    except LLM_DOWN as e:
+        # ไม่มีของสำรองให้คืน = พฤติกรรมเดิม ปล่อย error ขึ้นไปให้ผู้เรียกจัดการ
+        if chunks is None:
+            raise
+        rag.trace_note("llm_failed", outputs={"error": type(e).__name__,
+                                              "partial_chars": len(answer)})
+        fb = fallback_answer(chunks, e)
+        if answer:      # สตรีมไปแล้วบางส่วนก่อนล่ม ต้องบอกว่าท่อนบนถูกตัดกลางคัน
+            fb = ("\n\n> ⚠️ **คำตอบด้านบนถูกตัดกลางคัน** ระบบเขียนต่อไม่ได้\n\n" + fb)
+        yield {"stage": "⚠️ เขียนคำตอบไม่สำเร็จ — คืนตัวบทที่ค้นเจอแทน"}
+        yield {"token": fb}
+        answer, reasoning = (answer + fb if answer else fb), ""
     return answer, reasoning
 
 
@@ -416,7 +462,7 @@ def _answer_compare(llm, question: str, num: str, history: list,
         HumanMessage(content="\n\n".join(parts) +
                              f"\n\n================\nคำถาม: {question}"),
     ]
-    answer, reasoning = yield from _stream_answer(llm, messages, stream)
+    answer, reasoning = yield from _stream_answer(llm, messages, stream, chunks=points)
     yield {"final": {"answer": answer, "chunks": points, "reasoning": reasoning,
                      "groups_used": [rag.GROUP_IN_FORCE, rag.GROUP_HISTORY],
                      "elapsed": time.perf_counter() - t0, "search_q": reported_q}}
@@ -524,7 +570,8 @@ def answer_stream(llm, question: str, *, auto_group: bool = True,
 
     # 5) ตอบ (stream = yield ทีละ token) — ใช้ตัวเดียวกับเส้นทางเปรียบเทียบ
     yield {"stage": "เขียนคำตอบ"}
-    answer, reasoning = yield from _stream_answer(llm, messages, stream)
+    # ส่ง chunks ไปด้วย: LLM ล่มแล้วยังคืนตัวบทที่ค้นเจอได้ ดีกว่าทิ้งงานที่ทำมาแล้วทั้งหมด
+    answer, reasoning = yield from _stream_answer(llm, messages, stream, chunks=chunks)
 
     # ติดป้ายบนตัวคำตอบด้วย — ไม่ใช่แค่ event เพราะคำตอบอาจถูกก๊อปไปใช้ต่อโดยไม่มี event ติดไป
     if degraded:
