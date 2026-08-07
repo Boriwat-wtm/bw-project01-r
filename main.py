@@ -76,6 +76,19 @@ async def lifespan(_app: FastAPI):
     #   2. reranker: โหลดตอนใช้ครั้งแรก วัดแล้วทำให้คำถามแรกช้า ~85 วินาที
     #      เทียบกับ ~8-20 วินาทีตอนอุ่นแล้ว — ผู้ใช้คนแรกไม่ควรเป็นคนจ่ายค่านี้
     rag._ensure_loaded()
+
+    # ด่านกันดัชนีเพี้ยนเงียบ ๆ — id ของ chunk คือ "<ไฟล์>::<ลำดับ>" ผูกกับ "ลำดับที่อ่านได้"
+    # ถ้ารอบนี้อ่าน PDF ได้ไม่เท่าเดิม (เช่นหน้าสแกน OCR ไม่ออกเพราะเครื่องไม่มีโมเดล)
+    # ลำดับจะเลื่อนทั้งไฟล์ แล้วข้อความที่ค้นได้จะไม่ใช่ข้อความของเวกเตอร์นั้น
+    # = ตอบผิดโดยไม่มีอะไรฟ้อง จึงต้องหยุดตั้งแต่บูต ไม่ใช่ปล่อยให้เปิดเสิร์ฟ
+    n_mem, n_db = len(rag._chunks), rag._collection.count()
+    if n_mem != n_db:
+        raise RuntimeError(
+            f"ดัชนีไม่ตรงกับเอกสาร: อ่าน PDF ได้ {n_mem} chunk แต่ใน Chroma มี {n_db} เวกเตอร์\n"
+            "  สาเหตุที่พบบ่อย: ocr_cache หายไป ทำให้หน้าสแกนอ่านไม่ออก\n"
+            "  แก้: เอา ocr_cache/ มาให้ครบ หรือสร้างดัชนีใหม่ด้วย\n"
+            "       python -c \"import rag; rag.build_vectorstore(force=True)\"")
+
     if rag.RERANK_ENABLED:
         print("[i] อุ่น reranker...")
         rag.rerank("ทดสอบ", [{"text": "ประมวลกฎหมายที่ดิน"}], 1)
@@ -212,10 +225,16 @@ class Feedback(BaseModel):
 
 @router.post("/feedback")
 def feedback(fb: Feedback):
-    """เก็บ feedback ลง feedback.jsonl (บรรทัดละ 1 record)"""
+    """เก็บ feedback ลง feedback.jsonl (บรรทัดละ 1 record)
+
+    ตั้ง FEEDBACK_PATH ชี้ออกนอกโฟลเดอร์โปรเจกต์ได้ — ใน container ต้องใช้ ไม่งั้น
+    ไฟล์อยู่ในเลเยอร์ที่เขียนได้ของ container แล้วหายทุกครั้งที่สร้างใหม่
+    """
     import datetime
     rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"), **fb.model_dump()}
-    path = os.path.join(os.path.dirname(__file__), "feedback.jsonl")
+    path = os.environ.get("FEEDBACK_PATH") or os.path.join(
+        os.path.dirname(__file__), "feedback.jsonl")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return {"ok": True}

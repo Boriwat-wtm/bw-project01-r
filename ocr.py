@@ -16,6 +16,7 @@ OCR_DPI = int(os.environ.get("OCR_DPI", "200"))       # render หน้า PDF 
 OCR_LANGS = ["th", "en"]                              # ไทย + อังกฤษ (กฎหมายมักมีอังกฤษปน)
 
 _reader = None
+_file_keys: dict[str, str] = {}   # path -> hash ของเนื้อไฟล์ (คำนวณครั้งเดียวต่อไฟล์)
 
 
 def _get_reader():
@@ -31,8 +32,29 @@ def _get_reader():
     return _reader
 
 
+def _file_key(path: str) -> str:
+    """ลายนิ้วมือของ 'เนื้อไฟล์' — ไม่ผูกกับที่อยู่ไฟล์หรือเวลาแก้ไข"""
+    if path not in _file_keys:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for b in iter(lambda: f.read(65536), b""):
+                h.update(b)
+        _file_keys[path] = h.hexdigest()
+    return _file_keys[path]
+
+
 def _cache_path(path: str, page_index: int) -> str:
-    key = f"{os.path.abspath(path)}::{os.path.getmtime(path)}::{page_index}::{OCR_DPI}"
+    """กุญแจแคช = เนื้อไฟล์ + เลขหน้า + DPI
+
+    ⚠️ เดิมใช้ abspath + mtime ซึ่งพังทันทีที่ย้ายเครื่อง: ใน container path เป็น
+    /app/data/... และ git ไม่เก็บ mtime -> แคชพลาดทุกหน้า -> ต้อง OCR ใหม่
+    แต่ _get_reader ตั้ง download_enabled=False ไว้ ถ้าเครื่องนั้นไม่มีโมเดล EasyOCR
+    จะโยน error ซึ่ง rag._load_pdf ดักแล้วแค่ print -> หน้านั้นได้ข้อความว่าง
+    -> จำนวน chunk เปลี่ยน -> id ('<source>::<ลำดับ>') เลื่อน -> ไม่ตรงกับเวกเตอร์
+    ที่อยู่ใน chroma_db ทั้งชุด และไม่มีอะไรฟ้องว่าพัง
+    ใช้ hash ของเนื้อไฟล์แทน -> แคชเดินทางไปกับ repo ได้ ผลเหมือนกันทุกเครื่อง
+    """
+    key = f"{_file_key(path)}::{page_index}::{OCR_DPI}"
     h = hashlib.md5(key.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}.txt")
 
