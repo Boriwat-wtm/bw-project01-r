@@ -1,0 +1,24 @@
+# ใช้คู่กับ docker-compose.yml เมื่อเครื่องมีการ์ด NVIDIA
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# ต้องติดตั้ง nvidia-container-toolkit บนเครื่องโฮสต์ก่อน ตรวจว่าใช้ได้ด้วย:
+#   docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+#
+# ⚠️ ไฟล์นี้ override ให้ build ด้วย torch ตัว CUDA แทนตัว CPU
+# อิมเมจจะใหญ่ขึ้นราว 2 GB แลกกับ reranker ที่เร็วกว่ามาก
+
+services:
+  api:
+    build:
+      context: .
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+    image: thai-law-rag:1.0-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

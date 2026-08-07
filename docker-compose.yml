@@ -1,0 +1,71 @@
+# Thai Law RAG — API ถาม-ตอบประมวลกฎหมายที่ดิน
+#
+#   1) เตรียมค่า:  cp .env.example .env   แล้วเติม LLM_BASE_URL / LLM_API_KEY / API_KEY
+#   2) รัน:        docker compose up -d --build
+#   3) ตรวจ:       curl http://localhost:8000/health
+#   4) ดูล็อก:     docker compose logs -f api
+#
+# มี GPU:  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+# เปิด UI: docker compose --profile ui up -d
+
+services:
+  api:
+    build: .
+    image: thai-law-rag:1.0
+    container_name: thai-law-rag-api
+    restart: unless-stopped
+
+    # ค่าทั่วไปอ่านจาก .env (ไฟล์นี้ถูก .dockerignore กันไม่ให้เข้าอิมเมจ)
+    env_file: .env
+    environment:
+      # ⚠️ LLM_API_KEY เจตนาไม่เก็บลงไฟล์ — ค่าจริงอยู่ใน env ของเครื่อง
+      #    ถ้าปล่อยให้ env_file จัดการ container จะได้ค่าว่างแล้วตายตอนบูตด้วย
+      #    "openai.OpenAIError: Missing credentials" ซึ่งอ่านแล้วไม่รู้ว่าต้องแก้ตรงไหน
+      #    :? ทำให้ compose หยุดตั้งแต่ยังไม่สร้าง container พร้อมบอกวิธีแก้
+      #    (ต้องใส่ quote ครอบ ไม่งั้น ": " ในข้อความจะทำให้ YAML พัง)
+      LLM_API_KEY: '${LLM_API_KEY:?ยังไม่ได้ตั้งบนเครื่องนี้ — Windows ใช้ setx LLM_API_KEY "<คีย์>" แล้วเปิด terminal ใหม่ · Linux ใช้ export LLM_API_KEY=...}'
+      # ตัดคำไทยด้วย pythainlp ต้องมี ไม่งั้นค้นด้วยคำจะหยาบลง (/health จะรายงาน degraded)
+      RAG_RERANK: "1"        # ปิดเป็น "0" ถ้าเครื่องช้าและยอมให้ความแม่นลดลง
+      LLM_TIMEOUT: "120"
+      # เก็บ feedback ไว้ใน volume ไม่งั้นหายทุกครั้งที่สร้าง container ใหม่
+      FEEDBACK_PATH: /app/var/feedback.jsonl
+
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+    # ดัชนีกับเอกสารอยู่ในอิมเมจแล้ว ไม่ต้อง mount อะไรจากเครื่องโฮสต์
+    # ยกเว้นอยากเก็บ feedback ที่ผู้ใช้ส่งเข้ามาไว้นอก container
+    volumes:
+      - feedback:/app/var
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s     # บูตจริงกินเวลา 1-3 นาที (อ่าน PDF + สร้าง BM25 + อุ่น reranker)
+      retries: 3
+
+    # reranker กิน RAM พอควร ตั้งเพดานกันไปเบียดบริการอื่นบนเครื่องเดียวกัน
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  # หน้าเว็บแชท (ไม่จำเป็นสำหรับ API) — เปิดด้วย --profile ui
+  ui:
+    build: .
+    image: thai-law-rag:1.0
+    container_name: thai-law-rag-ui
+    profiles: ["ui"]
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    command: >
+      streamlit run app.py
+      --server.address=0.0.0.0
+      --server.port=8501
+      --server.headless=true
+
+volumes:
+  feedback:

@@ -1,0 +1,29 @@
+# .venv 6 GB — ห้ามหลุดเข้า build context เด็ดขาด (ช้ามากและไม่ได้ใช้)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ความลับ — ส่งเข้า container ตอนรันด้วย env_file ไม่ใช่ฝังในอิมเมจ
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ประวัติ git ไม่ต้องใช้ตอนรัน
+.git/
+.github/
+
+# ของเฉพาะเครื่อง / ผลการทดลอง
+mlruns/
+reports/
+chat_history.json
+feedback.jsonl
+.round_counter.json
+chroma_db_*/
+ocr_cache_company/
+*.xlsx
+
+# เครื่องมือผู้ช่วย
+.claude/
+gridgeist/
